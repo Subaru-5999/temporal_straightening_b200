@@ -85,3 +85,112 @@ def test_env_defaults_agree_with_the_tracked_cells():
     for name, protocol in rt.CFG.items():
         env = name.split("_", 1)[0]
         assert rt.ENV_DEFAULTS[env] == protocol, name
+
+
+# ------------------------------------------------- CEM arm + planning-time capture
+import json
+
+import summarize_run as sr
+
+
+def test_plan_roots_cover_the_three_arms():
+    assert set(rt.PLAN_ROOTS) == {"gd", "gd_mpc", "cem"}
+    for arm, (root, cfg, extra) in rt.PLAN_ROOTS.items():
+        assert root.startswith("plan_outputs_")
+        assert cfg.endswith(".yaml")
+        assert isinstance(extra, list)
+
+
+def test_cem_arm_is_open_loop_terminal_objective():
+    """Table 4: open-loop uses the terminal objective and executes 25 actions.
+    conf/plan_cem.yaml already sets max_iter=1 / n_taken_actions=25, so the arm
+    only needs to pin objective.mode=last."""
+    _, cfg, extra = rt.PLAN_ROOTS["cem"]
+    assert cfg == "plan_cem.yaml"
+    assert "objective.mode=last" in extra
+
+
+def test_gd_arm_carries_no_extra_overrides():
+    """The GD arms must stay byte-identical to the reproduced Table 1."""
+    assert rt.PLAN_ROOTS["gd"][2] == []
+    assert rt.PLAN_ROOTS["gd_mpc"][2] == []
+
+
+@pytest.mark.parametrize("line,expected", [
+    ("[timing] perform_planning_s=123.456", 123.456),
+    ("prefix [timing] perform_planning_s=0.5 suffix", 0.5),
+    ("[timing]perform_planning_s=7", 7.0),
+])
+def test_timing_line_is_parsed(line, expected):
+    m = rt.TIMING_RE.search(line)
+    assert m and float(m.group(1)) == expected
+
+
+@pytest.mark.parametrize("line", [
+    "[timing] setup_model_s=12.3",           # a different timer
+    "[timing] total_planning_main_s=99.9",   # must not be mistaken for it
+    "perform_planning_s=5",                  # no [timing] tag
+])
+def test_other_timing_lines_are_ignored(line):
+    assert rt.TIMING_RE.search(line) is None
+
+
+def test_read_timing_missing_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path))
+    assert sr.read_timing("nope") == {}
+
+
+def test_read_timing_averages_seeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path))
+    (tmp_path / "r.timing.json").write_text(
+        json.dumps({"gd": [10.0, 20.0, 30.0], "cem": [100.0, 200.0]}))
+    t = sr.read_timing("r")
+    assert t["gd"]["mean_s"] == pytest.approx(20.0)
+    assert t["gd"]["n"] == 3
+    assert t["cem"]["mean_s"] == pytest.approx(150.0)
+
+
+def test_read_timing_survives_corruption(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path))
+    (tmp_path / "r.timing.json").write_text("{not json")
+    assert sr.read_timing("r") == {}
+
+
+def test_read_timing_drops_nulls(tmp_path, monkeypatch):
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path))
+    (tmp_path / "r.timing.json").write_text(json.dumps({"gd": [None], "cem": [5.0]}))
+    t = sr.read_timing("r")
+    assert "gd" not in t and t["cem"]["mean_s"] == 5.0
+
+
+def test_discover_runs_includes_the_tracked_cells(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path / "results"))
+    assert set(sr.discover_runs()) >= set(sr.PAPER)
+
+
+def test_discover_runs_finds_objective_variants(tmp_path, monkeypatch):
+    """The regression: `--all` iterated PAPER only, so variant runs were skipped."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(tmp_path / "results"))
+    variant = "pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgFalse_lr1e-05_sig1e-1_e2e"
+    (tmp_path / "plan_outputs_gd" / f"{variant}_gH25_dset").mkdir(parents=True)
+    (tmp_path / "plan_outputs_cem" / f"{variant}_gH25_dset").mkdir(parents=True)
+    found = sr.discover_runs()
+    assert variant in found
+    assert found.count(variant) == 1          # de-duplicated across roots
+
+
+def test_discover_runs_ignores_bookkeeping_json(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    res = tmp_path / "results"
+    res.mkdir()
+    monkeypatch.setattr(sr, "RESULTS_DIR", str(res))
+    for junk in ("table1_reproduction.json", "x.timing.json", "y_trainseed.json",
+                 "z_seed2.json"):
+        (res / junk).write_text("{}")
+    (res / "real_run.json").write_text("{}")
+    found = sr.discover_runs()
+    assert "real_run" in found
+    for bad in ("table1_reproduction", "x", "y_trainseed", "z_seed2"):
+        assert bad not in found

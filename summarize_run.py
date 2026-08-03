@@ -93,13 +93,32 @@ def within_band(d):
     return "OK" if abs(d["mean"] - pm) <= ps + BAND_TOL else f"OFF {d['mean']-pm:+.2f}"
 
 
+def read_timing(name):
+    """Per-arm planning wall time, written by reproduce_table1.py. {} if absent."""
+    path = os.path.join(RESULTS_DIR, f"{name}.timing.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        raw = json.load(open(path))
+    except Exception:
+        return {}
+    out = {}
+    for arm, vals in raw.items():
+        vals = [float(v) for v in vals if v is not None]
+        if vals:
+            out[arm] = {"mean_s": sum(vals) / len(vals), "n": len(vals), "seeds_s": vals}
+    return out
+
+
 def summarize_one(name):
     ol = read_success_rates("plan_outputs_gd", name)      # open-loop GD
     mpc = read_success_rates("plan_outputs_gd_mpc", name)  # MPC (GD subplanner)
+    cem = read_success_rates("plan_outputs_cem", name)     # open-loop CEM (speed baseline)
     ol_m, ol_s, ol_n = stats(ol)
     mpc_m, mpc_s, mpc_n = stats(mpc)
+    cem_m, cem_s, cem_n = stats(cem)
     paper = PAPER.get(name) or PAPER.get(base_cell(name), {"label": name, "ol": None, "mpc": None})
-    if ol_n == 0 and mpc_n == 0:
+    if ol_n == 0 and mpc_n == 0 and cem_n == 0:
         # No logs.json for this run yet -- don't clobber any existing results/<name>.json
         print(f"  (no logs found for {name}; skipping)")
         return None
@@ -107,6 +126,11 @@ def summarize_one(name):
         "run": name, "label": paper["label"],
         "open_loop": {"seeds": ol, "mean": ol_m, "std": ol_s, "n": ol_n, "paper": paper["ol"]},
         "mpc":       {"seeds": mpc, "mean": mpc_m, "std": mpc_s, "n": mpc_n, "paper": paper["mpc"]},
+        # CEM has no paper target in Table 1 (which is GD-only); it is the
+        # sampling-based reference for the speed/success comparison.
+        "cem_open_loop": {"seeds": cem, "mean": cem_m, "std": cem_s, "n": cem_n,
+                          "paper": None},
+        "timing": read_timing(name),
     }
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with open(os.path.join(RESULTS_DIR, f"{name}.json"), "w") as f:
@@ -120,11 +144,23 @@ def print_block(rec):
     print(f"RESULT  {rec['run']}")
     print(f"        {rec['label']}")
     print("=" * 76)
-    for key, tag in [("open_loop", "Open-loop"), ("mpc", "MPC")]:
+    rows = [("open_loop", "Open-loop"), ("mpc", "MPC")]
+    if rec.get("cem_open_loop", {}).get("n"):
+        rows.append(("cem_open_loop", "OL (CEM)"))
+    for key, tag in rows:
         d = rec[key]
         paper = f"{d['paper'][0]:.2f}+/-{d['paper'][1]:.2f}" if d["paper"] else "n/a"
         seeds = ", ".join(f"{x:.0f}" for x in d["seeds"]) if d["seeds"] else "none"
         print(f"  {tag:10s} ours {fmt_cell(d):24s} paper {paper:14s} [{within_band(d)}]   seeds: {seeds}")
+
+    t = rec.get("timing") or {}
+    if t:
+        parts = [f"{arm} {t[arm]['mean_s']:.1f}s" for arm in ("gd", "gd_mpc", "cem") if arm in t]
+        print(f"  {'plan time':10s} {'  |  '.join(parts)}")
+        if "gd" in t and "cem" in t and t["gd"]["mean_s"] > 0:
+            print(f"  {'speed':10s} GD is {t['cem']['mean_s'] / t['gd']['mean_s']:.2f}x "
+                  f"faster than CEM (open-loop, same model)")
+
     for key in ("open_loop", "mpc"):
         if rec[key]["n"] != 3:
             print(f"  WARNING: {key} has {rec[key]['n']} seed result(s), expected 3 -- rerun the missing seed(s).")
@@ -146,23 +182,50 @@ def rebuild_master():
     order = {n: i for i, n in enumerate(PAPER)}
     recs.sort(key=lambda r: order.get(r["run"], 999))
 
+    # CEM / timing columns only appear once some run actually has them, so the
+    # table stays identical to before for a GD-only reproduction.
+    any_cem = any(r.get("cem_open_loop", {}).get("n") for r in recs)
+    any_time = any(r.get("timing") for r in recs)
+
+    head = ["Run", "Setting", "Ours Open-loop", "Paper OL", "Ours MPC", "Paper MPC"]
+    if any_cem:
+        head.append("OL CEM")
+    if any_time:
+        head += ["GD OL s", "CEM OL s", "GD speedup"]
     md = ["# Table 1 reproduction (GD planner, 3 data seeds 100/200/300, 50 samples)",
           "",
-          "| Run | Setting | Ours Open-loop | Paper OL | Ours MPC | Paper MPC |",
-          "|-----|---------|----------------|----------|----------|-----------|"]
-    csv = ["run,setting,ol_mean,ol_std,ol_n,ol_seeds,paper_ol_mean,paper_ol_std,"
-           "mpc_mean,mpc_std,mpc_n,mpc_seeds,paper_mpc_mean,paper_mpc_std"]
+          "| " + " | ".join(head) + " |",
+          "|" + "|".join(["-" * max(3, len(h)) for h in head]) + "|"]
+    csv_head = ["run", "setting", "ol_mean", "ol_std", "ol_n", "ol_seeds",
+                "paper_ol_mean", "paper_ol_std", "mpc_mean", "mpc_std", "mpc_n",
+                "mpc_seeds", "paper_mpc_mean", "paper_mpc_std",
+                "cem_ol_mean", "cem_ol_std", "cem_ol_n",
+                "gd_ol_time_s", "gd_mpc_time_s", "cem_ol_time_s"]
+    csv = [",".join(csv_head)]
     for r in recs:
         ol, mpc = r["open_loop"], r["mpc"]
+        cem = r.get("cem_open_loop") or {"mean": None, "std": None, "n": 0, "seeds": [], "paper": None}
+        t = r.get("timing") or {}
+        tg = t.get("gd", {}).get("mean_s")
+        tm = t.get("gd_mpc", {}).get("mean_s")
+        tc = t.get("cem", {}).get("mean_s")
         pol = f"{ol['paper'][0]:.2f}+/-{ol['paper'][1]:.2f}" if ol["paper"] else ""
         pmpc = f"{mpc['paper'][0]:.2f}+/-{mpc['paper'][1]:.2f}" if mpc["paper"] else ""
-        md.append(f"| {r['run']} | {r['label']} | {fmt_cell(ol)} | {pol} | {fmt_cell(mpc)} | {pmpc} |")
+        row = [r["run"], r["label"], fmt_cell(ol), pol, fmt_cell(mpc), pmpc]
+        if any_cem:
+            row.append(fmt_cell(cem) if cem["n"] else "")
+        if any_time:
+            row += [f"{tg:.1f}" if tg else "", f"{tc:.1f}" if tc else "",
+                    f"{tc / tg:.2f}x" if (tg and tc) else ""]
+        md.append("| " + " | ".join(row) + " |")
         csv.append(",".join(str(x) for x in [
             r["run"], r["label"].replace(",", " "),
             ol["mean"], ol["std"], ol["n"], " ".join(map(str, ol["seeds"])),
             ol["paper"][0] if ol["paper"] else "", ol["paper"][1] if ol["paper"] else "",
             mpc["mean"], mpc["std"], mpc["n"], " ".join(map(str, mpc["seeds"])),
             mpc["paper"][0] if mpc["paper"] else "", mpc["paper"][1] if mpc["paper"] else "",
+            cem["mean"], cem["std"], cem["n"],
+            tg if tg else "", tm if tm else "", tc if tc else "",
         ]))
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with open(os.path.join(RESULTS_DIR, "table1_reproduction.md"), "w") as f:
@@ -183,9 +246,32 @@ def main():
     elif args.all:
         # Re-scan every known run's logs.json from scratch (recomputes results/<name>.json
         # with the current parser -- use this to re-derive results without re-running evals).
-        for name in PAPER:
+        for name in discover_runs():
             summarize_one(name)
     rebuild_master()
+
+
+def discover_runs():
+    """Every run worth rescanning: the tracked cells plus anything already evaluated.
+
+    Iterating PAPER alone silently skipped objective variants (e.g. the
+    '..._sig1e-1_e2e' runs), so `--all` never rebuilt them. Names are recovered
+    from the plan_outputs_* directory names, which are '<run>_gH<...>_<goal_source>'.
+    """
+    names = list(PAPER)
+    for root in ("plan_outputs_gd", "plan_outputs_gd_mpc", "plan_outputs_cem"):
+        for d in glob.glob(os.path.join(root, "*_gH*")):
+            base = re.sub(r"_gH\d+.*$", "", os.path.basename(d))
+            if base and base not in names:
+                names.append(base)
+    for f in glob.glob(os.path.join(RESULTS_DIR, "*.json")):
+        b = os.path.basename(f)
+        if b.endswith(("_trainseed.json", ".timing.json")) or re.search(r"_seed\d+\.json$", b):
+            continue
+        base = b[:-len(".json")]
+        if base not in names and not base.startswith("table1_"):
+            names.append(base)
+    return names
 
 
 if __name__ == "__main__":

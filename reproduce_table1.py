@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import glob
+import json
 import shutil
 import argparse
 import subprocess
@@ -126,22 +127,50 @@ def eval_protocol(name):
     return None
 
 
-def clean_scoped(name):
+PLAN_ROOTS = {
+    # arm -> (hydra output root, root config, extra overrides beyond alpha/seed)
+    "gd":     ("plan_outputs_gd",     "plan_gd.yaml",     []),                 # open-loop GD
+    "gd_mpc": ("plan_outputs_gd_mpc", "plan_gd_mpc.yaml", []),                 # MPC, GD subplanner
+    "cem":    ("plan_outputs_cem",    "plan_cem.yaml",    ["objective.mode=last"]),  # open-loop CEM
+}
+
+
+def clean_scoped(name, arms=None):
     """Remove ONLY this run's plan_outputs so its logs.json holds exactly its 3 seeds."""
-    for root in ("plan_outputs_gd", "plan_outputs_gd_mpc"):
+    roots = [PLAN_ROOTS[a][0] for a in (arms or PLAN_ROOTS)]
+    for root in roots:
         for d in glob.glob(os.path.join(root, f"{name}_*")):
             shutil.rmtree(d, ignore_errors=True)
 
 
+# plan.py already prints "[timing] perform_planning_s=<float>"; capture it so the
+# GD-vs-CEM speed comparison has numbers instead of anecdote.
+TIMING_RE = re.compile(r"\[timing\]\s*perform_planning_s=([0-9.]+)")
+
+
 def run_plan(cfg_name, run_dir, name, extra):
+    """Run one plan.py job. Returns (returncode, perform_planning_seconds|None).
+
+    stdout is piped so the timing line can be parsed and echoed; stderr is left
+    attached to the terminal so tqdm progress bars still render live.
+    """
     cmd = [sys.executable, "plan.py", "--config-name", cfg_name,
            f"ckpt_base_path={run_dir}", f"model_name={name}", "model_epoch=latest",
            "decode_for_viz=false"] + extra
     print("   $ " + " ".join(cmd), flush=True)
-    return subprocess.run(cmd, env=os.environ).returncode
+    secs = None
+    proc = subprocess.Popen(cmd, env=os.environ, stdout=subprocess.PIPE,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        m = TIMING_RE.search(line)
+        if m:
+            secs = float(m.group(1))
+    proc.stdout.close()
+    return proc.wait(), secs
 
 
-def run_eval(name, base):
+def run_eval(name, base, arms=("gd", "gd_mpc")):
     protocol = eval_protocol(name)
     if protocol is None:
         print(f"!!! SKIP {name}: unknown env prefix (no alpha/mode mapping). "
@@ -157,18 +186,34 @@ def run_eval(name, base):
         print(f"!!! SKIP {name}: missing hydra.yaml or checkpoints/model_latest.pth under {run_dir}", flush=True)
         return
 
-    clean_scoped(name)
+    clean_scoped(name, arms)
 
-    print(">>> OPEN-LOOP (plan_gd.yaml, objective.mode=last, execute 25)", flush=True)
-    for s in SEEDS:
-        if run_plan("plan_gd.yaml", run_dir, name, [f"objective.alpha={alpha}", f"seed={s}"]):
-            print(f"FAIL OL {name} seed={s}", flush=True)
+    timings = {}
+    for arm in arms:
+        root, cfg_name, extra = PLAN_ROOTS[arm]
+        over = list(extra) + [f"objective.alpha={alpha}"]
+        if arm == "gd_mpc":
+            over.append(f"objective.mode={mpc_mode}")
+        label = {"gd": "OPEN-LOOP GD (execute 25)",
+                 "gd_mpc": f"MPC GD (mode={mpc_mode}, execute 5)",
+                 "cem": "OPEN-LOOP CEM (execute 25)"}[arm]
+        print(f">>> {label}  [{cfg_name}]", flush=True)
+        secs = []
+        for s in SEEDS:
+            rc, t = run_plan(cfg_name, run_dir, name, over + [f"seed={s}"])
+            if rc:
+                print(f"FAIL {arm} {name} seed={s}", flush=True)
+            if t is not None:
+                secs.append(t)
+        if secs:
+            timings[arm] = secs
+            print(f"   [time] {arm}: {sum(secs)/len(secs):.1f} s mean over "
+                  f"{len(secs)} seed(s)", flush=True)
 
-    print(f">>> MPC (plan_gd_mpc.yaml, objective.mode={mpc_mode}, execute 5)", flush=True)
-    for s in SEEDS:
-        if run_plan("plan_gd_mpc.yaml", run_dir, name,
-                    [f"objective.alpha={alpha}", f"objective.mode={mpc_mode}", f"seed={s}"]):
-            print(f"FAIL MPC {name} seed={s}", flush=True)
+    if timings:
+        os.makedirs("results", exist_ok=True)
+        with open(os.path.join("results", f"{name}.timing.json"), "w") as f:
+            json.dump(timings, f, indent=2)
 
     # Immediate, run-scoped summary + results/<name>.json
     summarize_run.summarize_one(name)
@@ -179,11 +224,20 @@ def main():
     ap.add_argument("runs", nargs="*", help="run basenames to evaluate (default: all 5 tracked runs)")
     ap.add_argument("--base", default=os.path.join(os.getcwd(), "checkpoints", "test"),
                     help="folder containing the run dirs (default ./checkpoints/test)")
+    ap.add_argument("--planners", default="gd,gd_mpc",
+                    help="comma-separated arms from " + ",".join(PLAN_ROOTS) +
+                         ". Default reproduces the paper's GD-only Table 1; add "
+                         "'cem' for the GD-vs-CEM speed/success comparison.")
     args = ap.parse_args()
+    arms = [a.strip() for a in args.planners.split(",") if a.strip()]
+    bad = [a for a in arms if a not in PLAN_ROOTS]
+    if bad:
+        ap.error(f"unknown planner arm(s) {bad}; choose from {sorted(PLAN_ROOTS)}")
     runs = args.runs if args.runs else ORDER
-    print(f"BASE={args.base}  DATASET_DIR={os.environ['DATASET_DIR']}  runs={len(runs)}", flush=True)
+    print(f"BASE={args.base}  DATASET_DIR={os.environ['DATASET_DIR']}  "
+          f"runs={len(runs)}  arms={arms}", flush=True)
     for name in runs:
-        run_eval(name, args.base)
+        run_eval(name, args.base, arms=arms)
     print("\n############### FINAL TABLE-1 REPRODUCTION ###############", flush=True)
     summarize_run.rebuild_master()
     print("\nALL EVALS DONE", flush=True)
