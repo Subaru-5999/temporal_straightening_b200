@@ -174,7 +174,10 @@ def test_probe_r2_detects_information_loss():
     state = torch.randn(32, 4, 2, generator=g)
     informative = torch.cat([state, torch.randn(32, 4, 6, generator=g)], dim=-1)
     assert dg.probe_r2(informative, state) > 0.99
-    assert dg.probe_r2(torch.zeros(32, 4, 8), state) == pytest.approx(0.0, abs=1e-3)
+    # A constant latent carries nothing. Held out, that reads as "<= 0" rather
+    # than exactly 0: predicting the fit half's mean on the held-out half is
+    # slightly worse than that half's own mean, so a small negative is correct.
+    assert dg.probe_r2(torch.zeros(32, 4, 8), state) < 0.05
 
 
 def test_curvature_cos_is_one_for_a_straight_trajectory():
@@ -201,3 +204,62 @@ def test_diagnostics_never_raise_on_degenerate_input():
     out = dg.curvature_cos(torch.randn(2, 2, 4))
     assert out != out                          # NaN for T < 3, no exception
     assert dg.probe_r2(torch.randn(2, 2, 4), torch.randn(3, 2, 1)) != 0.5
+
+
+# ------------------------------------------- held-out probe (overfitting guard)
+def test_probe_r2_is_held_out_not_in_sample():
+    """The bug this fixes: a 128-dim latent probed from 128 samples fitted 129
+    coefficients and returned exactly R^2 = 1.0 on the real smoke run.
+
+    Pure noise carries no information about the state, so a held-out score must
+    be near zero or negative even when the in-sample fit is perfect.
+    """
+    g = torch.Generator().manual_seed(0)
+    b, t, d = 32, 4, 128                       # 128 samples, 128 features
+    noise = torch.randn(b, t, d, generator=g)
+    state = torch.randn(b, t, 2, generator=g)
+    r2 = dg.probe_r2(noise, state)
+    assert r2 < 0.5, f"held-out R^2 on pure noise should not be high, got {r2}"
+
+
+def test_probe_r2_still_finds_real_information():
+    """A latent that genuinely contains the state must still score high."""
+    g = torch.Generator().manual_seed(0)
+    state = torch.randn(48, 4, 2, generator=g)
+    z = torch.cat([state, torch.randn(48, 4, 6, generator=g)], dim=-1)
+    assert dg.probe_r2(z, state) > 0.95
+
+
+def test_probe_r2_zero_for_a_constant_latent():
+    """No information -> held-out R^2 at or just below zero, never high."""
+    state = torch.randn(32, 4, 2, generator=torch.Generator().manual_seed(0))
+    r2 = dg.probe_r2(torch.ones(32, 4, 8), state)
+    assert -0.5 < r2 < 0.05, r2
+
+
+def test_probe_r2_needs_enough_samples_to_split():
+    state = torch.randn(2, 2, 2)
+    out = dg.probe_r2(torch.randn(2, 2, 8), state)
+    assert out != out                          # NaN, not a fabricated number
+
+
+def test_probe_r2_split_is_interleaved_not_contiguous():
+    """A contiguous split would put all late-time samples in the held-out half.
+
+    Build a latent whose scale drifts with the batch index: an interleaved split
+    keeps both halves comparable, so the score stays high.
+    """
+    g = torch.Generator().manual_seed(0)
+    b, t = 40, 4
+    state = torch.randn(b, t, 2, generator=g)
+    drift = torch.linspace(1.0, 5.0, b).reshape(b, 1, 1)
+    z = torch.cat([state * drift, torch.randn(b, t, 4, generator=g)], dim=-1)
+    assert dg.probe_r2(z, state) > 0.5
+
+
+def test_diagnostics_dict_uses_the_held_out_probe():
+    g = torch.Generator().manual_seed(0)
+    state = torch.randn(32, 4, 2, generator=g)
+    noise = torch.randn(32, 4, 128, generator=g)
+    out = dg.latent_diagnostics(noise, state=state)
+    assert out["probe_r2"] < 0.5               # would have been 1.0 before

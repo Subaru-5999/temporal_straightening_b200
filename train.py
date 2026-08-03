@@ -937,6 +937,23 @@ class Trainer:
                 **{f"loss/{k}": v for k, v in loss_components.items()},
             )
             self.telemetry.record(self.global_iter, **{"progress/epoch": self.epoch})
+
+            # Collapse diagnostics DURING training, not just once per epoch.
+            # val() runs them per epoch, which over a 123,858-step run is two or
+            # three data points -- far too coarse to catch collapse while there
+            # is still time to react. Cost is one extra encoder forward every
+            # diag_every steps.
+            diag_every = int(self.cfg.training.get("diag_every", 500))
+            if diag_every > 0 and self.global_iter % diag_every == 0:
+                self.model.eval()
+                diag = self._latent_diagnostics(obs, act, state)
+                self.model.train()
+                self.telemetry.probe_latents(
+                    self.global_iter,
+                    {"latent/" + k.replace("val_", "", 1): v[0]
+                     for k, v in diag.items()},
+                )
+
             self.telemetry.maybe_flush(self.global_iter)
 
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}

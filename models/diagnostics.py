@@ -93,32 +93,48 @@ def curvature_cos(z: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def probe_r2(z: torch.Tensor, state: torch.Tensor, ridge: float = 1e-4) -> float:
-    """R^2 of a closed-form ridge probe from the latent to the true state.
+def probe_r2(z: torch.Tensor, state: torch.Tensor, ridge: float = 1e-3) -> float:
+    """HELD-OUT R^2 of a ridge linear probe from the latent to the true state.
+
+    Fit on half the samples, scored on the other half. The in-sample version of
+    this metric is worthless whenever the latent has many dimensions relative to
+    the batch: a 128-dim aggregated latent probed from a 32x4 val batch fits 129
+    coefficients from 128 rows and returns exactly R^2 = 1.0, which is what it
+    did before this was a split fit. A held-out score exposes that instead of
+    hiding it -- an overfitted probe simply scores badly on the other half.
+
+    The split is interleaved (even/odd samples) rather than contiguous, so the
+    two halves both span the batch and the time axis.
 
     Args:
         z: (b, t, ...) latents.
         state: (b, t, s) ground-truth state.
     Returns:
-        R^2 in [-1, 1]; ~0 means the latent carries no linear information about
-        the state, which is the signature of collapse.
+        Held-out R^2, clamped to [-1, 1]. ~0 or below means the latent carries
+        no usable linear information about the state -- the signature of
+        collapse. NaN when there are too few samples to split.
     """
     if z.dim() < 3 or state.dim() != 3:
         return _NAN
     b, t = z.shape[0], z.shape[1]
-    if state.shape[0] != b or state.shape[1] != t or b * t < 4:
+    if state.shape[0] != b or state.shape[1] != t or b * t < 8:
         return _NAN
     X = z.reshape(b * t, -1).float()
     Y = state.reshape(b * t, -1).float()
     X = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device)], dim=1)
-    gram = X.T @ X
-    gram = gram + ridge * torch.eye(gram.shape[0], device=X.device)
+
+    fit, held = X[0::2], X[1::2]
+    y_fit, y_held = Y[0::2], Y[1::2]
+    if fit.shape[0] < 2 or held.shape[0] < 2:
+        return _NAN
+
+    gram = fit.T @ fit + ridge * torch.eye(fit.shape[1], device=X.device)
     try:
-        W = torch.linalg.lstsq(gram, X.T @ Y).solution
+        W = torch.linalg.lstsq(gram, fit.T @ y_fit).solution
     except Exception:                                  # pragma: no cover
         return _NAN
-    resid = ((X @ W - Y) ** 2).sum()
-    total = ((Y - Y.mean(0, keepdim=True)) ** 2).sum()
+    resid = ((held @ W - y_held) ** 2).sum()
+    total = ((y_held - y_held.mean(0, keepdim=True)) ** 2).sum()
     if total <= 0:
         return _NAN
     return float((1 - resid / total).clamp(-1, 1).item())

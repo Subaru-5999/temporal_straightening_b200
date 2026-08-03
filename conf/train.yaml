@@ -77,6 +77,11 @@ training:
   backbone_lr: null
   # Per-epoch latent collapse/straightness metrics on the first val batch.
   log_diagnostics: True
+  # Also compute them every N TRAINING steps. val() alone gives one point per
+  # epoch, i.e. 2-3 points across a 123,858-step run, which is far too coarse to
+  # catch collapse while there is still time to react. 0 disables.
+  # Cost: one extra encoder forward every N steps (~0.5% at 500).
+  diag_every: 500
   # ---- Bounded-memory training telemetry ----
   # Appends one JSON record per telemetry_every steps to
   # <run_dir>/telemetry/train_<timestamp>.jsonl, holding every loss term, the
