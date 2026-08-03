@@ -97,6 +97,17 @@ class SIGReg(nn.Module):
                 f"SIGReg expects (T, B, D); got shape {tuple(proj.shape)}. "
                 "Flatten any extra axes into B before calling."
             )
+        # Always evaluate the statistic in at least float32. Training runs under
+        # accelerate with mixed_precision=bf16, so the encoder hands us bf16
+        # latents, and this statistic averages cosines over the batch and then
+        # squares the deviation from phi -- differences of order 1e-2 between
+        # numbers of order 1, which is where bf16's ~3 significant digits bite.
+        # The tensors here are tiny (T x B x M x knots on an 8- or 128-dim
+        # latent), so the upcast is free, and the gradient still flows back into
+        # the bf16 graph. Without it, lambda_SIG would effectively be noisy.
+        if proj.dtype not in (torch.float32, torch.float64):
+            proj = proj.float()
+
         d = proj.size(-1)
         # fresh random directions on the unit sphere every step (sketching)
         A = torch.randn(d, self.num_proj, device=proj.device, dtype=proj.dtype)

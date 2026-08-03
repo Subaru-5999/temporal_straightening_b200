@@ -202,3 +202,36 @@ def test_forward_does_not_mutate_buffers():
     loss(gaussian())
     for b, a in zip(before, (loss.t, loss.phi, loss.weights)):
         assert torch.equal(b, a)
+
+
+def test_bf16_input_is_evaluated_in_fp32():
+    """Training runs under mixed_precision=bf16, so the latents arrive as bf16.
+
+    The statistic must not be computed at bf16 precision: it averages cosines
+    over the batch and squares a ~1e-2 deviation from phi, so 3 significant
+    digits is not enough and lambda_SIG would be effectively noisy.
+    """
+    loss = sig(num_proj=256, seed=1)
+    z = gaussian(seed=1)
+    torch.manual_seed(0)
+    ref = loss(z).item()
+    torch.manual_seed(0)
+    got = loss(z.to(torch.bfloat16)).item()
+    # bf16 rounding of the *input* still shifts things slightly, but the result
+    # must be close to the fp32 answer, not merely finite
+    assert got == pytest.approx(ref, rel=0.05), (got, ref)
+
+
+def test_bf16_gradients_flow_back_into_the_bf16_graph():
+    z = (torch.randn(T, 64, D) * 2).to(torch.bfloat16).requires_grad_(True)
+    out = SIGReg(num_proj=64)(z)
+    out.backward()
+    assert z.grad is not None
+    assert z.grad.dtype == torch.bfloat16
+    assert torch.isfinite(z.grad.float()).all()
+
+
+def test_fp32_and_fp64_are_left_alone():
+    for dt in (torch.float32, torch.float64):
+        out = SIGReg(num_proj=32)(gaussian().to(dt))
+        assert out.dtype == dt
