@@ -77,6 +77,16 @@ training:
   backbone_lr: null
   # Per-epoch latent collapse/straightness metrics on the first val batch.
   log_diagnostics: True
+  # ---- Bounded-memory training telemetry ----
+  # Appends one JSON record per telemetry_every steps to
+  # <run_dir>/telemetry/train_<timestamp>.jsonl, holding every loss term, the
+  # latent collapse metrics, per-module gradient/weight norms and their ratio,
+  # and measured weight movement. Memory is O(#metrics), not O(#steps): each
+  # metric is a Welford accumulator, and the only histories are capped deques.
+  # Disk: 123,858 steps / 200 = ~620 records, a few MB.
+  # Read it back with: python summarize_training_log.py <path>
+  telemetry: True
+  telemetry_every: 200
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

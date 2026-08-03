@@ -259,7 +259,7 @@ def t1_t2():
 # ============================================================== T3/T4/T5
 def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
                stop_grad=True, seed=0, b=8, sigreg=False, sigreg_coeff=0.0,
-               curv_on="features"):
+               curv_on="features", telemetry_dir=None):
     torch.manual_seed(seed)
     wm = build(stop_grad=stop_grad, straighten=straighten, freeze_backbone=freeze_backbone,
                sigreg=sigreg, sigreg_coeff=sigreg_coeff, curv_on=curv_on)
@@ -273,6 +273,21 @@ def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
     probe = rollout(16, 4, gen=torch.Generator().manual_seed(999))   # held out
     wm.train()
 
+    # Optional: emit the same bounded telemetry the real trainer writes, so the
+    # whole log -> digest pipeline can be exercised on CPU in seconds.
+    tl = None
+    if telemetry_dir:
+        from training_log import TrainingLogger
+        slug = tag.split()[0].lower() + "_" + tag.split()[1].strip("_").lower()
+        tl = TrainingLogger(
+            os.path.join(telemetry_dir, f"{slug}.jsonl"),
+            run_name=tag,
+            config={"freeze_backbone": freeze_backbone, "sigreg": sigreg,
+                    "sigreg_coeff": sigreg_coeff, "straighten": straighten,
+                    "stop_grad": stop_grad, "curv_on": curv_on, "lr": lr},
+            log_every=max(1, steps // 20),
+        )
+
     print(f"\n  {tag}")
     print(f"    {'step':>5} {'z_visual_loss':>14} {'std(b,t)':>11} {'eff_rank/8':>11} "
           f"{'probe R^2':>10} {'curv':>9} {'sigreg':>10}")
@@ -280,6 +295,8 @@ def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
     for i in range(steps + 1):
         obs, act, _ = rollout(b, 4, gen=g)               # fresh data every step
         *_, loss, comp = wm(obs, act)
+        if tl is not None:
+            tl.record(i, **{f"loss/{k}": float(v.item()) for k, v in comp.items()})
         if i % (steps // 6) == 0:
             wm.eval()
             s, r, r2 = diagnostics(wm, *probe)
@@ -290,15 +307,34 @@ def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
                   f"{r:>11.3f} {r2:>10.4f} {c.item():>9.4f} {sg_val.item():>10.3f}")
             if i == 0:
                 first = (s, r, r2)
+            if tl is not None:
+                tl.probe_latents(i, {"latent/std": s, "latent/eff_rank": r,
+                                     "latent/eff_rank_frac": r / 8.0,
+                                     "latent/probe_r2": r2})
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        if tl is not None and i % tl.log_every == 0:
+            tl.probe_modules(i, {"encoder.trunk": wm.encoder.base_model,
+                                 "encoder.projector": wm.encoder.projector,
+                                 "predictor": wm.predictor},
+                             lr_by_group={"encoder.trunk": lr,
+                                          "encoder.projector": lr,
+                                          "predictor": 5e-4})
         opt.step()
+        if tl is not None:
+            tl.maybe_flush(i)
 
     wm.eval()
     s, r, r2 = diagnostics(wm, *probe)
     print(f"    -> std(b,t) {first[0]:.5f} -> {s:.5f} "
           f"({100 * (1 - s / max(first[0], 1e-12)):.1f}% of latent variation lost)")
     print(f"       eff_rank {first[1]:.2f} -> {r:.2f} | probe R^2 {first[2]:.4f} -> {r2:.4f}")
+    if tl is not None:
+        tl.probe_latents(steps, {"latent/std": s, "latent/eff_rank": r,
+                                 "latent/eff_rank_frac": r / 8.0,
+                                 "latent/probe_r2": r2})
+        tl.close(steps, status="completed", memory=tl.memory_report())
+        print(f"       telemetry -> {tl.path}")
     return s, r, r2
 
 

@@ -24,6 +24,7 @@ from metrics.image_metrics import eval_images
 from models.diagnostics import latent_diagnostics
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
 from iteration_budget import IterationBudget
+from training_log import TrainingLogger
 import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import time.
 
 warnings.filterwarnings("ignore")
@@ -168,6 +169,40 @@ class Trainer:
             max_iterations=self.cfg.training.get("max_iterations", None),
         )
         log.info(self.budget.describe())
+
+        # Bounded-memory telemetry: a replayable traceback of the run. Memory is
+        # O(#metrics), not O(#steps); one JSON record per telemetry_every steps.
+        tel_every = int(self.cfg.training.get("telemetry_every", 200))
+        self.telemetry = TrainingLogger(
+            path=os.path.join(
+                self.cfg.saved_folder, "telemetry",
+                f"train_{time.strftime('%Y%m%d_%H%M%S')}.jsonl",
+            ),
+            run_name=model_name,
+            config={
+                "env": self.cfg.env.name,
+                "encoder": self.cfg.encoder.get("_target_", "?"),
+                "straighten": self.cfg.training.get("straighten", False),
+                "curv_on": self.cfg.training.get("curv_on", "features"),
+                "sigreg": self.cfg.training.get("sigreg", False),
+                "sigreg_coeff": self.cfg.training.get("sigreg_coeff", 0.0),
+                "stop_grad": self.cfg.training.get("stop_grad", True),
+                "freeze_backbone": self.cfg.training.get("freeze_backbone", True),
+                "encoder_lr": self.cfg.training.encoder_lr,
+                "backbone_lr": self.cfg.training.get("backbone_lr", None),
+                "predictor_lr": self.cfg.training.predictor_lr,
+                "batch_size": self.cfg.training.batch_size,
+                "epochs": self.total_epochs,
+                "max_iterations": self.cfg.training.get("max_iterations", None),
+                "iters_per_epoch": self.budget.iters_per_epoch,
+                "seed": self.cfg.training.seed,
+            },
+            log_every=tel_every,
+            enabled=bool(self.cfg.training.get("telemetry", True))
+                     and self.accelerator.is_main_process,
+        )
+        if self.telemetry.enabled:
+            log.info("Telemetry -> %s (every %s steps)", self.telemetry.path, tel_every)
 
         self.encoder = None
         self.action_encoder = None
@@ -668,6 +703,8 @@ class Trainer:
                     with lock:
                         self.job_set.update(jobs)
 
+            self.telemetry.event(self.global_iter, "epoch_end",
+                                 f"epoch {self.epoch} finished")
             if self._stop_requested:
                 log.info(
                     "Run finished on the iteration budget: %s optimizer steps "
@@ -678,6 +715,65 @@ class Trainer:
                     self.total_epochs,
                 )
                 break
+
+        self.telemetry.close(
+            step=self.global_iter,
+            status="budget_reached" if self._stop_requested else "epochs_completed",
+            epochs_run=self.epoch,
+            memory=self.telemetry.memory_report(),
+        )
+        if self.telemetry.enabled:
+            log.info("Telemetry written: %s", self.telemetry.path)
+            log.info("Digest it with: python summarize_training_log.py %s",
+                     self.telemetry.path)
+
+    def _telemetry_groups(self):
+        """The module groups worth tracking separately in the telemetry.
+
+        Split so the visual trunk is visible on its own: it is the part that was
+        never trained before, and the part most likely to be mis-tuned now.
+        """
+        enc = self.encoder
+        groups = {}
+        base = getattr(enc, "base_model", None)
+        if base is not None:
+            groups["encoder.trunk"] = base
+        for attr in ("projector", "agg_mlp"):
+            mod = getattr(enc, attr, None)
+            if mod is not None:
+                groups[f"encoder.{attr}"] = mod
+        if self.cfg.has_predictor and self.predictor is not None:
+            groups["predictor"] = self.predictor
+        if self.action_encoder is not None:
+            groups["action_encoder"] = self.action_encoder
+        if self.proprio_encoder is not None:
+            groups["proprio_encoder"] = self.proprio_encoder
+        return groups
+
+    def _probe_module_health(self, step):
+        """Gradient/weight norms, their ratio, and measured weight movement."""
+        try:
+            lrs = {}
+            enc_groups = self.encoder_optimizer.param_groups
+            # _encoder_param_groups puts the trunk first when backbone_lr is set
+            if len(enc_groups) > 1:
+                lrs["encoder.trunk"] = enc_groups[0]["lr"]
+                lrs["encoder.projector"] = enc_groups[1]["lr"]
+                lrs["encoder.agg_mlp"] = enc_groups[1]["lr"]
+            else:
+                for name in ("encoder.trunk", "encoder.projector", "encoder.agg_mlp"):
+                    lrs[name] = enc_groups[0]["lr"]
+            if self.cfg.has_predictor:
+                lrs["predictor"] = self.predictor_optimizer.param_groups[0]["lr"]
+            self.telemetry.probe_modules(step, self._telemetry_groups(), lr_by_group=lrs)
+            if torch.cuda.is_available():
+                self.telemetry.record(
+                    step,
+                    **{"sys/gpu_mem_alloc_gb": torch.cuda.memory_allocated() / 1e9,
+                       "sys/gpu_mem_reserved_gb": torch.cuda.memory_reserved() / 1e9},
+                )
+        except Exception as e:  # pragma: no cover - telemetry never breaks a run
+            log.warning("Module-health probe failed (skipping): %s", e)
 
     @torch.no_grad()
     def _latent_diagnostics(self, obs, act, state=None):
@@ -755,6 +851,11 @@ class Trainer:
 
             self.accelerator.backward(loss)
 
+            # Probe gradients AFTER backward and BEFORE step, on the telemetry
+            # cadence only, so the cost is amortised to ~nothing.
+            if self.telemetry.enabled and self.global_iter % self.telemetry.log_every == 0:
+                self._probe_module_health(self.global_iter)
+
             if self.model.train_encoder:
                 self.encoder_optimizer.step()
             if decoder_active:
@@ -829,6 +930,15 @@ class Trainer:
                     phase="train",
                 )
 
+            # Telemetry: every loss term separately, every step, into O(1)-memory
+            # accumulators. A falling total says nothing about which term moved.
+            self.telemetry.record(
+                self.global_iter,
+                **{f"loss/{k}": v for k, v in loss_components.items()},
+            )
+            self.telemetry.record(self.global_iter, **{"progress/epoch": self.epoch})
+            self.telemetry.maybe_flush(self.global_iter)
+
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
@@ -889,7 +999,16 @@ class Trainer:
             # minimise it is to stop responding to the input. These metrics are
             # what separates the two cases.
             if plot and self.cfg.training.get("log_diagnostics", True):
-                self.logs_update(self._latent_diagnostics(obs, act, state))
+                diag = self._latent_diagnostics(obs, act, state)
+                self.logs_update(diag)
+                # same numbers into the telemetry, renamed to latent/* and
+                # threshold-checked so a collapse raises a dated event
+                self.telemetry.probe_latents(
+                    self.global_iter,
+                    {"latent/" + k.replace("val_", "", 1): v[0]
+                     for k, v in diag.items()},
+                )
+                self.telemetry.flush(self.global_iter)
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 

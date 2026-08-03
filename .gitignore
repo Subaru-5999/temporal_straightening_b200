@@ -30,3 +30,6 @@ _paper.txt
 *.log
 .ipynb_checkpoints/
 .train_pid
+# telemetry output (runtime artifact; regenerate by training)
+logs/
+telemetry/
