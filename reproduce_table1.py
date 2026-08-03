@@ -83,10 +83,47 @@ CFG = {
 ORDER = list(CFG)
 
 
+# (alpha, mpc_mode) is a property of the ENVIRONMENT, not of the training
+# objective: alpha=1 and mode=staged for PushT (images + proprio, terminal loss
+# within H), alpha=0 and mode=all elsewhere. Sec 5.3.
+ENV_DEFAULTS = {
+    "umaze": (0, "all"),
+    "medium": (0, "all"),
+    "wall": (0, "all"),
+    "pusht": (1, "staged"),
+}
+
+
 def base_cell(name):
-    """Strip a trailing _seed<N> so training-seed variants map to their base cell's
-    (alpha, mpc_mode) and paper targets. 'pusht_..._lr1e-06_seed2' -> 'pusht_..._lr1e-06'."""
-    return re.sub(r"_seed\d+$", "", name)
+    """Map a run name onto the Table-1 cell whose eval protocol it should use.
+
+    Exact match first, so the five tracked cells behave exactly as before. Then
+    strip a trailing _seed<N> for training-seed variants. Otherwise fall back to
+    the leading environment token, which is what actually determines the eval
+    protocol -- this is what lets objective variants (e.g. the SIGReg /
+    end-to-end runs, '..._sgFalse_lr1e-05_sig1e-1_e2e') be evaluated with the
+    right objective instead of being skipped as unknown.
+    """
+    if name in CFG:
+        return name
+    stripped = re.sub(r"_seed\d+$", "", name)
+    if stripped in CFG:
+        return stripped
+    return None
+
+
+def eval_protocol(name):
+    """(alpha, mpc_mode) for a run, or None if the environment is unrecognised."""
+    cell = base_cell(name)
+    if cell is not None:
+        return CFG[cell]
+    env = name.split("_", 1)[0]
+    if env in ENV_DEFAULTS:
+        alpha, mode = ENV_DEFAULTS[env]
+        print(f"   [driver] '{name}' is not a tracked cell; using the {env} "
+              f"protocol (alpha={alpha}, mpc={mode}) from its env prefix.", flush=True)
+        return alpha, mode
+    return None
 
 
 def clean_scoped(name):
@@ -105,11 +142,12 @@ def run_plan(cfg_name, run_dir, name, extra):
 
 
 def run_eval(name, base):
-    cell = base_cell(name)
-    if cell not in CFG:
-        print(f"!!! SKIP {name}: unknown run (no alpha/mode mapping)", flush=True)
+    protocol = eval_protocol(name)
+    if protocol is None:
+        print(f"!!! SKIP {name}: unknown env prefix (no alpha/mode mapping). "
+              f"Known: {sorted(ENV_DEFAULTS)}", flush=True)
         return
-    alpha, mpc_mode = CFG[cell]
+    alpha, mpc_mode = protocol
     run_dir = os.path.join(base, name)
     print("\n" + "#" * 60, flush=True)
     print(f"# RUN: {name}\n#   alpha={alpha}  open-loop=last  mpc={mpc_mode}", flush=True)
