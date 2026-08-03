@@ -302,3 +302,65 @@ def test_summariser_csv_export(tmp_path):
     assert csv_path.exists() and "wrote" in out
     header = csv_path.read_text(encoding="utf-8").splitlines()[0]
     assert header.startswith("step,") and "loss/loss" in header
+
+
+# ------------------------------------------------- input resolution / usability
+def run_summariser_raw(*args):
+    return subprocess.run(
+        [sys.executable, os.path.join(ROOT, "summarize_training_log.py"), *args],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+
+
+def test_unmatched_glob_explains_itself(tmp_path):
+    """The shell leaves an unmatched glob literal; say something useful."""
+    out = run_summariser_raw(str(tmp_path / "nope" / "*" / "*.jsonl"))
+    assert out.returncode == 1
+    assert "no telemetry logs found" in out.stderr
+    assert "telemetry/train_<timestamp>.jsonl" in out.stderr
+    assert "find . -name" in out.stderr          # actionable next command
+
+
+def test_directory_is_searched_recursively(tmp_path):
+    d = tmp_path / "run" / "telemetry"
+    d.mkdir(parents=True)
+    write_synthetic(d / "train_a.jsonl", collapse=False)
+    out = run_summariser_raw(str(tmp_path))
+    assert out.returncode == 0
+    assert "train_a.jsonl" in out.stdout
+
+
+def test_multiple_logs_are_each_digested(tmp_path):
+    for name in ("a", "b"):
+        d = tmp_path / name / "telemetry"
+        d.mkdir(parents=True)
+        write_synthetic(d / f"train_{name}.jsonl", collapse=False)
+    out = run_summariser_raw(str(tmp_path))
+    assert out.returncode == 0
+    assert "2 logs matched" in out.stdout
+    assert out.stdout.count("TRAINING TELEMETRY") == 2
+
+
+def test_latest_picks_one(tmp_path):
+    import time as _t
+    for name in ("old", "new"):
+        d = tmp_path / name / "telemetry"
+        d.mkdir(parents=True)
+        write_synthetic(d / f"train_{name}.jsonl", collapse=False)
+        _t.sleep(0.02)
+    out = run_summariser_raw(str(tmp_path), "--latest")
+    assert out.returncode == 0
+    assert out.stdout.count("TRAINING TELEMETRY") == 1
+    assert "train_new.jsonl" in out.stdout
+
+
+def test_header_only_log_is_not_an_error(tmp_path):
+    """A run that died before the first flush must still be inspectable."""
+    p = tmp_path / "train_x.jsonl"
+    tl = TrainingLogger(p, run_name="barely started", log_every=500)
+    tl.record(3, **{"loss/loss": 1.0})
+    tl.event(3, "nonfinite", "something")
+    out = run_summariser_raw(str(p))
+    assert out.returncode == 0
+    assert "no interval records yet" in out.stdout
+    assert "nonfinite" in out.stdout             # the events still surface

@@ -25,6 +25,36 @@ import sys
 SECTIONS = ("loss", "latent", "grad", "delta", "lr")
 
 
+def resolve_inputs(paths):
+    """Expand directories and unmatched globs into a concrete list of log files.
+
+    Accepts any mix of files, directories and shell-unexpanded glob patterns, so
+    `summarize_training_log.py checkpoints/smoke` and
+    `... 'checkpoints/*/test/*/telemetry/*.jsonl'` both work, and a glob that the
+    shell left literal (because it matched nothing) produces a useful message
+    rather than "no such file".
+    """
+    import glob as _glob
+
+    found, missing = [], []
+    for p in paths:
+        if os.path.isdir(p):
+            hits = sorted(_glob.glob(os.path.join(p, "**", "*.jsonl"), recursive=True))
+            found.extend(hits) if hits else missing.append(f"{p} (directory, no *.jsonl inside)")
+        elif os.path.isfile(p):
+            found.append(p)
+        else:
+            hits = sorted(_glob.glob(p, recursive=True))
+            found.extend(hits) if hits else missing.append(p)
+    # de-duplicate, newest last
+    seen, out = set(), []
+    for f in sorted(found, key=lambda f: (os.path.getmtime(f), f)):
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out, missing
+
+
 def load(path):
     header, intervals, events, summary = None, [], [], None
     bad = 0
@@ -181,22 +211,54 @@ def event_digest(events, cap):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("path")
+    ap.add_argument("path", nargs="+",
+                    help="log file(s), a directory to search, or a glob pattern")
     ap.add_argument("--rows", type=int, default=22,
                     help="phase-table rows; output size is independent of run length")
     ap.add_argument("--metrics", default=",".join(SECTIONS),
                     help=f"comma-separated sections to show, from {SECTIONS}")
     ap.add_argument("--events", type=int, default=6, help="events shown per kind")
     ap.add_argument("--full-events", action="store_true")
+    ap.add_argument("--latest", action="store_true",
+                    help="if several logs match, digest only the newest")
     ap.add_argument("--csv", help="also write every interval mean to CSV")
     args = ap.parse_args()
 
-    if not os.path.exists(args.path):
-        sys.exit(f"no such file: {args.path}")
-    header, intervals, events, summary, bad = load(args.path)
+    files, missing = resolve_inputs(args.path)
+    if not files:
+        print("no telemetry logs found. Looked for:", file=sys.stderr)
+        for m in missing:
+            print(f"  {m}", file=sys.stderr)
+        print("\nTelemetry is written to <run_dir>/telemetry/train_<timestamp>.jsonl\n"
+              "where <run_dir> is the hydra output dir, i.e.\n"
+              "  <ckpt_base_path>/test/<run_name>/telemetry/\n\n"
+              "Find any log under the repo with:\n"
+              "  find . -name 'train_*.jsonl' -newermt '-1 day'\n\n"
+              "If nothing exists, training has not reached Trainer setup yet -- the\n"
+              "header record is written before the first step, so an empty result\n"
+              "means the run died earlier than that (check the training log).",
+              file=sys.stderr)
+        sys.exit(1)
+    if missing:
+        print(f"note: no match for {', '.join(missing)}", file=sys.stderr)
+    if len(files) > 1 and args.latest:
+        files = files[-1:]
+    if len(files) > 1:
+        print(f"# {len(files)} logs matched; digesting each. Use --latest for only "
+              f"the newest.\n")
+
+    for n, path in enumerate(files):
+        if n:
+            print("\n\n")
+        digest(path, args)
+
+
+def digest(path, args):
+    header, intervals, events, summary, bad = load(path)
 
     print("=" * 78)
     print(f"TRAINING TELEMETRY  {header.get('run','?') if header else '?'}")
+    print(f"  file         : {path}")
     print("=" * 78)
     if header:
         print(f"  started      : {header.get('started')}")
@@ -221,7 +283,12 @@ def main():
         print("  status       : NO SUMMARY RECORD -- run died or is still going")
 
     if not intervals:
-        sys.exit("\nno interval records; nothing to summarise")
+        print("\nno interval records yet -- the run has not reached the first flush.")
+        print(f"With telemetry_every={header.get('log_every') if header else '?'}, "
+              "the first record lands at that many steps.")
+        if events:
+            event_digest(events, None if args.full_events else args.events)
+        return
 
     wanted = [s.strip() for s in args.metrics.split(",") if s.strip()]
     titles = {
