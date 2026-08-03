@@ -14,10 +14,13 @@ defaults:
 ckpt_base_path: ./checkpoints
 
 hydra:
+  # variant_tag is '' for the original defaults, so every pre-existing run
+  # directory stays byte-identical; only the new opt-in variants get a suffix
+  # (e.g. _sig1e-1_e2e).
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -44,6 +47,36 @@ training:
   save_every_x_epoch: 1
   save_every_x_iterations: 1000
   straighten: False  # e.g. cos1e-2 or aggcos1e-2
+  # Where the curvature is measured, for the aggcos mode:
+  #   features (default) aggregate the tokens, then difference -- the original
+  #                      code path, and what the paper's Fig. "train_agg"
+  #                      caption describes ("applied to the aggregated features")
+  #   velocity           difference, then aggregate -- what App. B.6's equation
+  #                      C_t = cos(h(v_t), h(v_{t+1})) literally says
+  # These differ because the agg head is a nonlinear MLP. Ablation axis; state
+  # in the writeup which one was used.
+  curv_on: features
+  # ---- SIGReg: Sketched Isotropic Gaussian Regularization (LeJEPA / LeWM) ----
+  # The distributional anti-collapse term. Required to train the encoder
+  # end-to-end: the prediction loss alone is minimised by a constant encoder,
+  # and stop_grad does NOT prevent that (see experiments/verify_stop_grad.py).
+  # SIGReg pins the latent distribution (hence its scale); the curvature term
+  # pins the direction and is scale-invariant, so the two are complementary.
+  sigreg: False
+  sigreg_coeff: 0.0        # lambda_SIG. LeWM reference value: 0.1
+  sigreg_num_proj: 1024    # M random 1-D projections (LeWM: 1024)
+  sigreg_knots: 17         # quadrature nodes for the Epps-Pulley integral
+  sigreg_apply_to: agg     # agg (pooled trajectory repr) | patch (per-token)
+  # Fine-tune the pretrained visual trunk (DINOv2). False = end-to-end JEPA.
+  # True (default) reproduces the original behaviour, where the trunk was frozen
+  # unconditionally regardless of model.train_encoder.
+  freeze_backbone: True
+  # Separate lr for the trunk. null -> single param group at encoder_lr, exactly
+  # as before. The paper's 1e-6/1e-5 was tuned for a projector over a frozen
+  # trunk and is not a sensible rate for fine-tuning a ViT.
+  backbone_lr: null
+  # Per-epoch latent collapse/straightness metrics on the first val batch.
+  log_diagnostics: True
   decoder_start_epoch: 1  # start optimizing decoder at this epoch
   reconstruct_every_x_batch: 1000
   num_reconstruct_samples: 5

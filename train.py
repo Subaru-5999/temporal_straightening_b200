@@ -21,6 +21,7 @@ from hydra.core.hydra_config import HydraConfig
 from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
+from models.diagnostics import latent_diagnostics
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
 from iteration_budget import IterationBudget
 import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import time.
@@ -204,11 +205,30 @@ class Trainer:
         self.epoch_log = OrderedDict()
 
     def _configure_encoder_trainability(self):
+        # training.freeze_backbone controls whether the pretrained visual trunk
+        # (DINOv2) is trainable. Default True == the original behaviour, where
+        # the trunk was frozen unconditionally regardless of model.train_encoder.
+        # Set it False for the end-to-end variant; note that the frozen trunk is
+        # the only thing currently suppressing collapse (see
+        # experiments/verify_stop_grad.py T3/T4), so unfreezing without SIGReg
+        # will collapse the representation.
+        freeze_backbone = bool(self.cfg.training.get("freeze_backbone", True))
         base_model = getattr(self.encoder, "base_model", None)
         if base_model is not None:
             for param in base_model.parameters():
-                param.requires_grad = False
-            log.info("Encoder base_model is frozen.")
+                param.requires_grad = not freeze_backbone
+            log.info(
+                "Encoder base_model is %s (training.freeze_backbone=%s).",
+                "frozen" if freeze_backbone else "TRAINABLE (end-to-end)",
+                freeze_backbone,
+            )
+            if not freeze_backbone and not self.cfg.training.get("sigreg", False):
+                log.warning(
+                    "freeze_backbone=False with SIGReg off: nothing in the "
+                    "objective bounds the latent scale, so the encoder is free "
+                    "to collapse (probe R^2 -> 0). This is only valid as a "
+                    "deliberate negative control."
+                )
 
         if not self.train_encoder:
             for param in self.encoder.parameters():
@@ -220,7 +240,28 @@ class Trainer:
         for name, param in self.encoder.named_parameters():
             if not name.startswith("base_model."):
                 param.requires_grad = True
-        log.info("Encoder base_model frozen; non-backbone encoder modules are trainable.")
+        log.info(
+            "Encoder: base_model %s; non-backbone encoder modules are trainable.",
+            "frozen" if freeze_backbone else "trainable",
+        )
+
+        # Surface the silent no-op instead of leaving it invisible: with
+        # encoder=dino there is no projector and no agg head, so the encoder has
+        # zero trainable params and encoder_optimizer.step() does nothing every
+        # iteration. That is *correct* for the paper's frozen DINOv2 baseline
+        # row, so warn rather than raise -- raising would break that cell.
+        n_trainable = sum(
+            p.numel() for p in self.encoder.parameters() if p.requires_grad
+        )
+        log.info("Encoder trainable params: %s", f"{n_trainable:,}")
+        if n_trainable == 0:
+            log.warning(
+                "model.train_encoder=True but the encoder has 0 trainable "
+                "parameters: encoder_optimizer.step() is a no-op and "
+                "training.encoder_lr has no effect. Expected for the frozen "
+                "DINOv2 baseline (encoder=dino); otherwise use an encoder with a "
+                "trainable projector/head, or set training.freeze_backbone=False."
+            )
 
     def _log_trainable_params(self, module, module_name):
         if not self.accelerator.is_main_process:
@@ -430,17 +471,55 @@ class Trainer:
             num_action_repeat=self.cfg.num_action_repeat,
             num_proprio_repeat=self.cfg.num_proprio_repeat,
             straighten=self.cfg.training.get("straighten", False),
+            curv_on=self.cfg.training.get("curv_on", "features"),
             stop_grad=self.cfg.training.get("stop_grad", True),
             vcreg=self.cfg.training.get("vcreg", False),
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            sigreg=self.cfg.training.get("sigreg", False),
+            sigreg_coeff=self.cfg.training.get("sigreg_coeff", 0.0),
+            sigreg_num_proj=self.cfg.training.get("sigreg_num_proj", 1024),
+            sigreg_knots=self.cfg.training.get("sigreg_knots", 17),
+            sigreg_apply_to=self.cfg.training.get("sigreg_apply_to", "agg"),
         )
         self._log_trainable_params(self.model, "model")
 
+    def _encoder_param_groups(self):
+        """Split the encoder into trunk vs head param groups.
+
+        The paper's encoder lr (1e-6 / 1e-5) was tuned for a small projector on
+        top of a FROZEN trunk. Fine-tuning a ViT trunk at that rate is not a
+        sensible default, so training.backbone_lr gives the trunk its own rate.
+        When backbone_lr is null (or the trunk is frozen) this returns a single
+        group and reproduces the original single-group Adam exactly.
+        """
+        enc_lr = self.cfg.training.encoder_lr
+        backbone_lr = self.cfg.training.get("backbone_lr", None)
+        trunk, heads = [], []
+        for name, param in self.encoder.named_parameters():
+            if not param.requires_grad:
+                continue
+            (trunk if name.startswith("base_model.") else heads).append(param)
+
+        if backbone_lr is None or not trunk:
+            return [{"params": list(self.encoder.parameters()), "lr": enc_lr}]
+
+        log.info(
+            "Encoder param groups: trunk %s params @ lr=%s | heads %s params @ lr=%s",
+            f"{sum(p.numel() for p in trunk):,}",
+            backbone_lr,
+            f"{sum(p.numel() for p in heads):,}",
+            enc_lr,
+        )
+        groups = [{"params": trunk, "lr": float(backbone_lr)}]
+        if heads:
+            groups.append({"params": heads, "lr": enc_lr})
+        return groups
+
     def init_optimizers(self):
         self.encoder_optimizer = torch.optim.Adam(
-            self.encoder.parameters(),
+            self._encoder_param_groups(),
             lr=self.cfg.training.encoder_lr,
         )
         self.encoder_optimizer = self.accelerator.prepare(self.encoder_optimizer)
@@ -599,6 +678,26 @@ class Trainer:
                     self.total_epochs,
                 )
                 break
+
+    @torch.no_grad()
+    def _latent_diagnostics(self, obs, act, state=None):
+        """Collapse / straightness metrics on one batch, as {key: [value]} logs.
+
+        Never allowed to break training: any failure is logged and skipped.
+        """
+        try:
+            z = self.model.encode(obs, act)
+            z_visual = self.model.visual_only(z)
+            logs = latent_diagnostics(z_visual, state=state, prefix="val_")
+            # the aggregated trajectory representation is what both regularizers
+            # act on, so report its geometry too when the head exists
+            if hasattr(self.model.encoder, "agg"):
+                z_agg = self.model._agg_tokens(z_visual)
+                logs.update(latent_diagnostics(z_agg, state=state, prefix="val_agg_"))
+            return {k: [v] for k, v in logs.items()}
+        except Exception as e:  # pragma: no cover - diagnostics must never crash a run
+            log.warning("Latent diagnostics failed (skipping): %s", e)
+            return {}
 
     def err_eval_single(self, z_pred, z_tgt):
         logs = {}
@@ -784,6 +883,13 @@ class Trainer:
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
                 obs, act
             )
+
+            # Latent health, once per epoch on the first val batch. A falling
+            # prediction loss is not evidence of learning -- the cheapest way to
+            # minimise it is to stop responding to the input. These metrics are
+            # what separates the two cases.
+            if plot and self.cfg.training.get("log_diagnostics", True):
+                self.logs_update(self._latent_diagnostics(obs, act, state))
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 

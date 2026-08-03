@@ -119,7 +119,8 @@ def rollout(b, t, image_size=IMAGE_SIZE, gen=None):
 # --------------------------------------------------------------- model builder
 def build(image_size=IMAGE_SIZE, proj_out=8, stop_grad=True, straighten=False,
           freeze_backbone=True, depth=2, heads=4, mlp_dim=128, agg=True,
-          agg_hidden=64):
+          agg_hidden=64, sigreg=False, sigreg_coeff=0.0, sigreg_num_proj=256,
+          sigreg_apply_to="agg", curv_on="features"):
     """Mirror train.py::init_models() wiring for encoder=dino_channel."""
     from models.dino import DinoV2Encoder, ChannelProjector
     from models.proprio import ProprioceptiveEmbedding
@@ -172,7 +173,9 @@ def build(image_size=IMAGE_SIZE, proj_out=8, stop_grad=True, straighten=False,
         proprio_dim=10, action_dim=10, concat_dim=1,
         num_action_repeat=1, num_proprio_repeat=1,
         train_encoder=True, train_predictor=True, train_decoder=False,
-        straighten=straighten, stop_grad=stop_grad,
+        straighten=straighten, stop_grad=stop_grad, curv_on=curv_on,
+        sigreg=sigreg, sigreg_coeff=sigreg_coeff,
+        sigreg_num_proj=sigreg_num_proj, sigreg_apply_to=sigreg_apply_to,
     )
     return wm
 
@@ -255,9 +258,11 @@ def t1_t2():
 
 # ============================================================== T3/T4/T5
 def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
-               stop_grad=True, seed=0, b=8):
+               stop_grad=True, seed=0, b=8, sigreg=False, sigreg_coeff=0.0,
+               curv_on="features"):
     torch.manual_seed(seed)
-    wm = build(stop_grad=stop_grad, straighten=straighten, freeze_backbone=freeze_backbone)
+    wm = build(stop_grad=stop_grad, straighten=straighten, freeze_backbone=freeze_backbone,
+               sigreg=sigreg, sigreg_coeff=sigreg_coeff, curv_on=curv_on)
     enc_params = [p for p in wm.encoder.parameters() if p.requires_grad]
     other = list(wm.predictor.parameters()) + list(wm.proprio_encoder.parameters()) \
         + list(wm.action_encoder.parameters())
@@ -270,7 +275,8 @@ def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
 
     print(f"\n  {tag}")
     print(f"    {'step':>5} {'z_visual_loss':>14} {'std(b,t)':>11} {'eff_rank/8':>11} "
-          f"{'probe R^2':>10} {'curv':>9}")
+          f"{'probe R^2':>10} {'curv':>9} {'sigreg':>10}")
+    nan = torch.tensor(float("nan"))
     for i in range(steps + 1):
         obs, act, _ = rollout(b, 4, gen=g)               # fresh data every step
         *_, loss, comp = wm(obs, act)
@@ -278,9 +284,10 @@ def train_loop(tag, steps=300, lr=1e-3, freeze_backbone=True, straighten=False,
             wm.eval()
             s, r, r2 = diagnostics(wm, *probe)
             wm.train()
-            c = comp.get("curvature_loss_used_for_training", torch.tensor(float("nan")))
+            c = comp.get("curvature_loss_used_for_training", nan)
+            sg_val = comp.get("sigreg_loss", nan)
             print(f"    {i:>5} {comp['z_visual_loss'].item():>14.6f} {s:>11.5f} "
-                  f"{r:>11.3f} {r2:>10.4f} {c.item():>9.4f}")
+                  f"{r:>11.3f} {r2:>10.4f} {c.item():>9.4f} {sg_val.item():>10.3f}")
             if i == 0:
                 first = (s, r, r2)
         opt.zero_grad(set_to_none=True)
@@ -330,9 +337,54 @@ def t5():
                freeze_backbone=False, straighten="aggcos1e-1", lr=1e-3)
 
 
+def gates():
+    """Phase-3 gates 1-3 on CPU, before spending any GPU hour.
+
+    Gate 1  unfrozen + stop_grad, no SIGReg  -> MUST collapse (negative control)
+    Gate 2  unfrozen + SIGReg, no curvature  -> must NOT collapse
+    Gate 3  unfrozen + SIGReg + curvature    -> straighter, still no collapse
+    """
+    banner("GATES  Does SIGReg make end-to-end encoder training viable?")
+    print("  All runs: backbone UNFROZEN. Gates 2/3 follow LeJEPA/LeWM and drop")
+    print("  stop-gradient entirely. Pass = probe R^2 and eff_rank retained.")
+
+    results = {}
+    results["gate1_pred_only"] = train_loop(
+        "GATE 1  L_pred only, stop_grad=True (negative control -- must collapse)",
+        freeze_backbone=False, lr=1e-3, stop_grad=True)
+    results["gate2_sigreg"] = train_loop(
+        "GATE 2  L_pred + SIGReg (lambda=0.1), stop_grad=False",
+        freeze_backbone=False, lr=1e-3, stop_grad=False,
+        sigreg=True, sigreg_coeff=0.1)
+    results["gate3_sigreg_curv"] = train_loop(
+        "GATE 3  L_pred + SIGReg (0.1) + curvature (aggcos1e-1), stop_grad=False",
+        freeze_backbone=False, lr=1e-3, stop_grad=False,
+        sigreg=True, sigreg_coeff=0.1, straighten="aggcos1e-1")
+
+    banner("GATE VERDICT")
+    hdr = f"  {'gate':<22} {'std(b,t)':>10} {'eff_rank/8':>11} {'probe R^2':>10}   verdict"
+    print(hdr)
+    g1 = results["gate1_pred_only"]
+    for name, (s, r, r2) in results.items():
+        if name == "gate1_pred_only":
+            ok = r2 < 0.1
+            verdict = "PASS (collapsed, as required)" if ok else "FAIL (did not collapse)"
+        else:
+            # must retain information relative to the collapsed control
+            ok = r2 > max(0.2, 2 * g1[2]) and r > 1.5 * g1[1]
+            verdict = "PASS (no collapse)" if ok else "FAIL (collapsed)"
+        print(f"  {name:<22} {s:>10.5f} {r:>11.3f} {r2:>10.4f}   {verdict}")
+
+    c2, c3 = results["gate2_sigreg"], results["gate3_sigreg_curv"]
+    print(f"\n  Gate 3 vs Gate 2 (does curvature cost information?): "
+          f"probe R^2 {c2[2]:.4f} -> {c3[2]:.4f}, eff_rank {c2[1]:.3f} -> {c3[1]:.3f}")
+    return results
+
+
 if __name__ == "__main__":
     torch.set_num_threads(max(1, min(8, os.cpu_count() or 1)))
     t1_t2()
     t3_t4()
     t5()
+    gates()
     banner("done")

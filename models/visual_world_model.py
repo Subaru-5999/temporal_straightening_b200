@@ -27,11 +27,17 @@ class VWorldModel(nn.Module):
         train_predictor=False,
         train_decoder=True,
         straighten=False,
+        curv_on="features",
         stop_grad=True,
         vcreg=False,
         vcreg_std_coeff=0,
         vcreg_cov_coeff=0,
         vcreg_apply_to="enc",
+        sigreg=False,
+        sigreg_coeff=0.0,
+        sigreg_num_proj=1024,
+        sigreg_knots=17,
+        sigreg_apply_to="agg",
         **kwargs,
     ):
         super().__init__()
@@ -74,6 +80,39 @@ class VWorldModel(nn.Module):
 
         self.straighten = self.curvature_mode is not None and self.straighten_scale > 0
 
+        # Where the curvature is measured. The paper is internally inconsistent
+        # here: App. B.6's [agg] equation applies the head to the velocity,
+        #   C_t = cos(h(v_t), h(v_{t+1})),
+        # while Fig. "train_agg"'s caption says the curvature loss is applied to
+        # the *aggregated features*. These differ because h is a nonlinear MLP.
+        # "features" (aggregate, then difference) is the original code path and
+        # stays the default; "velocity" (difference, then aggregate) implements
+        # the equation. Ablate, and state which one the submission used.
+        if curv_on not in ("features", "velocity"):
+            raise ValueError(
+                f"curv_on must be 'features' or 'velocity', got {curv_on!r}"
+            )
+        self.curv_on = curv_on
+
+        # SIGReg: the distributional anti-collapse term (LeJEPA / LeWM).
+        self.sigreg_coeff = float(sigreg_coeff)
+        self.sigreg_enabled = bool(sigreg) and self.sigreg_coeff > 0
+        if sigreg_apply_to not in ("agg", "patch"):
+            raise ValueError(
+                f"sigreg_apply_to must be 'agg' or 'patch', got {sigreg_apply_to!r}"
+            )
+        self.sigreg_apply_to = sigreg_apply_to
+        self.sigreg = None
+        if self.sigreg_enabled:
+            from models.sigreg import SIGReg
+
+            self.sigreg = SIGReg(knots=int(sigreg_knots), num_proj=int(sigreg_num_proj))
+            if sigreg_apply_to == "agg" and not hasattr(encoder, "agg"):
+                raise ValueError(
+                    "sigreg_apply_to='agg' requires an encoder exposing .agg(); "
+                    "use sigreg_apply_to='patch' or an encoder with an agg head."
+                )
+
         log.info("num_action_repeat: %s", self.num_action_repeat)
         log.info("num_proprio_repeat: %s", self.num_proprio_repeat)
         log.info("proprio encoder: %s", proprio_encoder)
@@ -83,13 +122,30 @@ class VWorldModel(nn.Module):
         log.info("emb_dim: %s", self.emb_dim)
         if self.straighten:
             log.info(
-                "Straightening enabled: mode=%s, scale=%s",
+                "Straightening enabled: mode=%s, scale=%s, curv_on=%s",
                 self.curvature_mode,
                 self.straighten_scale,
+                self.curv_on,
             )
         else:
             log.info("Straightening disabled")
+        if self.sigreg_enabled:
+            log.info(
+                "SIGReg enabled: coeff=%s, num_proj=%s, knots=%s, apply_to=%s",
+                self.sigreg_coeff,
+                sigreg_num_proj,
+                sigreg_knots,
+                self.sigreg_apply_to,
+            )
+        else:
+            log.info("SIGReg disabled")
         log.info("Stop-grad enabled: %s", self.stop_grad)
+        if self.sigreg_enabled and self.stop_grad:
+            log.warning(
+                "SIGReg is on together with stop_grad=True. LeJEPA/LeWM train "
+                "fully end-to-end with no stop-gradient; stop_grad=False is the "
+                "intended setting for the SIGReg variant."
+            )
         log.info(
             "VCReg enabled: %s, apply_to=enc, std_coeff=%s, cov_coeff=%s",
             self.vcreg,
@@ -271,8 +327,23 @@ class VWorldModel(nn.Module):
             step1 = v1.norm(dim=-1)
             step2 = v2.norm(dim=-1)
             mask = (step1 > step_thresh) & (step2 > step_thresh)
+            # NaN guard: once the encoder shrinks, EVERY velocity can fall under
+            # step_thresh, and loss[mask].mean() on an empty tensor is NaN, which
+            # then poisons the whole objective. That regime is reachable exactly
+            # when the encoder is trainable, so return a hard 0 instead: a
+            # motionless latent trajectory has no curvature to penalise. Note
+            # that this is *not* a collapse barrier -- cosine curvature is
+            # scale-invariant and cannot see collapse. SIGReg is what pins the
+            # scale (see experiments/verify_stop_grad.py, T5).
+            if not bool(mask.any()):
+                return loss.sum() * 0.0        # keeps the graph, value exactly 0
             loss = loss[mask]
         return loss.mean()
+
+    def _agg_tokens(self, x):
+        """Apply the encoder aggregation head to a (b, t, p, d) tensor."""
+        b, t, p, d = x.shape
+        return self.encoder.agg(x.reshape(b * t, p, d)).reshape(b, t, -1)
 
     def total_curvature(self, features, mode="cos"):
         if features.shape[1] < 3:
@@ -281,11 +352,16 @@ class VWorldModel(nn.Module):
         if mode == "aggcos":
             if not hasattr(self.encoder, "agg"):
                 raise ValueError("curvature mode 'aggcos' requires encoder.agg().")
-            b, t, p, d = features.shape
-            tokens = features.reshape(b * t, p, d)
-            z = self.encoder.agg(tokens).reshape(b, t, -1)
-            v1 = z[:, 1:-1] - z[:, :-2]
-            v2 = z[:, 2:] - z[:, 1:-1]
+            if self.curv_on == "velocity":
+                # App. B.6 equation: aggregate the velocities, C_t = cos(h(v_t), h(v_{t+1}))
+                vel = features[:, 1:] - features[:, :-1]        # (b, t-1, p, d)
+                hv = self._agg_tokens(vel)                      # (b, t-1, d_h)
+                v1, v2 = hv[:, :-1], hv[:, 1:]
+            else:
+                # default ("features"): aggregate, then difference
+                z = self._agg_tokens(features)
+                v1 = z[:, 1:-1] - z[:, :-2]
+                v2 = z[:, 2:] - z[:, 1:-1]
         elif mode == "cos":
             v1 = features[:, 1:-1] - features[:, :-2]
             v2 = features[:, 2:] - features[:, 1:-1]
@@ -293,6 +369,20 @@ class VWorldModel(nn.Module):
             raise ValueError(f"Unknown curvature mode '{mode}'. Use 'cos' or 'aggcos'.")
 
         return self._cos_curvature(v1, v2)
+
+    def sigreg_loss(self, feats):
+        """SIGReg on the visual latents.
+
+        Args:
+            feats: (b, t, p, d) visual latents (proprio/action dims removed).
+        """
+        from models.sigreg import to_time_major
+
+        if self.sigreg_apply_to == "agg":
+            z = self._agg_tokens(feats)          # (b, t, d_h) global trajectory repr
+        else:
+            z = feats                            # (b, t, p, d), tokens -> batch axis
+        return self.sigreg(to_time_major(z))
 
     def forward(self, obs, act):
         """
@@ -362,6 +452,17 @@ class VWorldModel(nn.Module):
                 loss_components["z_vicreg_cov_loss"] = z_cov_loss
                 loss_components["z_vcreg_loss_scaled"] = z_reg_loss
                 loss = loss + z_reg_loss
+
+            # L = L_pred + lambda_SIG * SIGReg(Z) + lambda_curv * L_curv
+            # SIGReg pins the distribution (and hence the scale); the curvature
+            # term pins the direction. They act on orthogonal degrees of freedom,
+            # which is why neither alone is sufficient for end-to-end training.
+            if self.sigreg_enabled:
+                feats = self.visual_only(z)
+                sig = self.sigreg_loss(feats)
+                loss = loss + sig * self.sigreg_coeff
+                loss_components["sigreg_loss"] = sig
+                loss_components["sigreg_loss_scaled"] = sig * self.sigreg_coeff
 
             if self.straighten and self.straighten_scale > 0:
                 feats = self.visual_only(z)

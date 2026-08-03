@@ -16,6 +16,14 @@ checkpoints
 !all_results.sh
 !eval_pusht_3seeds.sh
 !train_pusht_on_paperiters.sh
+!train_pusht_e2e_sigreg.sh
+# Reference codebases are separate git clones -- committing them would create
+# broken gitlinks. Re-clone on demand:
+#   git clone https://github.com/lucas-maes/le-wm research_papers/le-wm
+research_papers/le-wm/
+research_papers/temporal-straightening/
+# duplicate of the tarball already tracked at the repo root
+research_papers/arXiv-2603.12231v2.tar.gz
 # local-only memory/context file (do not commit)
 AGENT_MEMORY.md
 _paper.txt
