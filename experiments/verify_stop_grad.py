@@ -198,8 +198,14 @@ def diagnostics(wm, obs, act, state):
     ev = torch.linalg.eigvalsh(xc.T @ xc / max(1, xc.shape[0] - 1)).clamp_min(0)
     eff_rank = (ev.sum() ** 2 / (ev.pow(2).sum() + 1e-12)).item()
 
-    # linear probe: flattened latent -> true (x, y), closed form ridge
-    X = zv.reshape(b * t, p * d)
+    # Linear probe: patch-MEAN latent -> true (x, y), closed-form ridge.
+    # The patch mean (d features) is used rather than the flattened latent
+    # (p*d features) because b*t samples cannot determine p*d coefficients:
+    # at 49 patches x 8 dims that is 393 unknowns from 64 samples, which fits
+    # anything and makes R^2 both inflated and LAPACK-driver dependent (it
+    # printed 0.98/0.68/0.9993 at step 0 across three identically-seeded runs).
+    # This matches models/diagnostics.latent_diagnostics, which already pools.
+    X = zv.mean(dim=2).reshape(b * t, d)
     X = torch.cat([X, torch.ones(X.shape[0], 1)], 1)
     Y = state.reshape(b * t, 2)
     lam = 1e-4 * torch.eye(X.shape[1])
