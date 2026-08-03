@@ -31,6 +31,15 @@ hydra:
 training:
   seed: 0
   epochs: 20
+  # Hard cap on TOTAL optimizer steps for the run, counted across epochs and
+  # preserved across resumes. null = disabled (epochs alone decide = original
+  # behaviour). It never extends a run: `epochs` stays an upper bound, so raise
+  # `epochs` if the cap needs more passes than it allows.
+  # Use it to pin objective/architecture variants to an identical update budget.
+  # Paper-exact budgets (batch_size 32, num_hist 3, num_pred 1, frameskip 5):
+  #   PushT (pusht_noise, 18,685 rollouts): 61,929 iters/epoch x 2 epochs = 123,858
+  # The exact iters/epoch for any env is logged at startup as "Iteration budget:".
+  max_iterations: null
   batch_size: 32 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   save_every_x_iterations: 1000

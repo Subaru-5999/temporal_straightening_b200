@@ -22,6 +22,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
+from iteration_budget import IterationBudget
 import custom_resolvers  # noqa: F401  # Registers OmegaConf resolvers at import time.
 
 warnings.filterwarnings("ignore")
@@ -74,6 +75,10 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        # Total optimizer steps taken across all epochs. Checkpointed, so the
+        # training.max_iterations budget survives a resume.
+        self.global_iter = 0
+        self._stop_requested = False
         self.decoder_start_epoch = int(self.cfg.training.get("decoder_start_epoch", 1))
         if self.decoder_start_epoch < 1:
             log.warning(
@@ -154,6 +159,15 @@ class Trainer:
             self.dataloaders["train"], self.dataloaders["valid"]
         )
 
+        # len() of the *prepared* loader is this process's batches per epoch, and
+        # there is exactly one optimizer step per batch, so it is the step unit.
+        self.budget = IterationBudget(
+            iters_per_epoch=len(self.dataloaders["train"]),
+            epochs=self.total_epochs,
+            max_iterations=self.cfg.training.get("max_iterations", None),
+        )
+        log.info(self.budget.describe())
+
         self.encoder = None
         self.action_encoder = None
         self.proprio_encoder = None
@@ -169,6 +183,7 @@ class Trainer:
 
         self._keys_to_save = [
             "epoch",
+            "global_iter",
         ]
         self._keys_to_save += (
             ["encoder", "encoder_optimizer"] if self.train_encoder else []
@@ -283,6 +298,23 @@ class Trainer:
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
             log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+            # Checkpoints written before training.max_iterations existed carry no
+            # global_iter; infer it from the completed epochs so the cap is not
+            # silently restarted from zero.
+            if self.global_iter == 0 and self.epoch > 0:
+                self.global_iter = self.budget.resume_estimate(self.epoch)
+                log.warning(
+                    "Checkpoint has no global_iter; estimating %s from %s completed "
+                    "epoch(s) x %s iters/epoch.",
+                    self.global_iter,
+                    self.epoch,
+                    self.budget.iters_per_epoch,
+                )
+            log.info(
+                "Resumed at global_iter=%s (budget remaining: %s)",
+                self.global_iter,
+                self.budget.remaining(self.global_iter),
+            )
         else:
             log.info("No checkpoint found; starting training from scratch.")
 
@@ -492,6 +524,18 @@ class Trainer:
             )
             self.monitor_thread.start()
 
+        if self.budget.enabled and not self.budget.is_reachable:
+            log.warning(
+                "training.max_iterations=%s is unreachable with training.epochs=%s "
+                "(%s iters/epoch -> %s steps max). Raise epochs to >= %s to spend the "
+                "full budget.",
+                self.budget.max_iterations,
+                self.total_epochs,
+                self.budget.iters_per_epoch,
+                self.budget.epoch_bounded_total,
+                self.budget.epochs_needed,
+            )
+
         init_epoch = self.epoch + 1  # epoch starts from 1
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
@@ -509,7 +553,12 @@ class Trainer:
             self.accelerator.wait_for_everyone()
             self.val()
             self.logs_flash(step=self.epoch)
-            if self.epoch % self.cfg.training.save_every_x_epoch == 0:
+            # `or self._stop_requested`: always checkpoint the final model when the
+            # iteration budget ends the run mid-epoch, even on a non-save epoch.
+            if (
+                self.epoch % self.cfg.training.save_every_x_epoch == 0
+                or self._stop_requested
+            ):
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
                 if (
@@ -539,6 +588,17 @@ class Trainer:
                     )
                     with lock:
                         self.job_set.update(jobs)
+
+            if self._stop_requested:
+                log.info(
+                    "Run finished on the iteration budget: %s optimizer steps "
+                    "(training.max_iterations=%s), stopped during epoch %s of %s.",
+                    self.global_iter,
+                    self.budget.max_iterations,
+                    self.epoch,
+                    self.total_epochs,
+                )
+                break
 
     def err_eval_single(self, z_pred, z_tgt):
         logs = {}
@@ -603,6 +663,8 @@ class Trainer:
             if self.cfg.has_predictor and self.model.train_predictor:
                 self.predictor_optimizer.step()
                 self.action_encoder_optimizer.step()
+
+            self.global_iter += 1
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
@@ -677,6 +739,21 @@ class Trainer:
             ):
                 self.logs_flash_iter(iteration=i)
                 self.save_ckpt()
+
+            # Hard iteration budget: stop the moment it is reached, mid-epoch.
+            # run() still runs val(), flushes the epoch log and saves a ckpt.
+            if self.budget.reached(self.global_iter):
+                self._stop_requested = True
+                log.info(
+                    "Iteration budget reached: global_iter=%s / max_iterations=%s "
+                    "(epoch %s, batch %s of %s). Stopping training.",
+                    self.global_iter,
+                    self.budget.max_iterations,
+                    self.epoch,
+                    i,
+                    self.budget.iters_per_epoch,
+                )
+                break
 
     @torch.no_grad()
     def val(self):
