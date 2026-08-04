@@ -117,11 +117,20 @@ def keys_in(intervals, section):
 def table(intervals, keys, rows, title):
     if not keys:
         return
+    # Downsample over the intervals that actually CONTAIN this section's metrics.
+    # Latent diagnostics land in only ~2 of every 5 interval records (diag_every
+    # 500 vs telemetry_every 200), so index-based downsampling over all intervals
+    # can alias onto empty ones and print a table of nothing but '-' even though
+    # the data is in the file.
+    populated = [r for r in intervals if any(get(r, k) is not None for k in keys)]
+    src = populated or intervals
     print(f"\n## {title}")
+    if populated and len(populated) < len(intervals):
+        print(f"  ({len(populated)} of {len(intervals)} intervals carry these metrics)")
     short = [k.split("/", 1)[1] for k in keys]
     width = max(9, max((len(s) for s in short), default=9) + 1)
     print("  " + "step".rjust(9) + "".join(s.rjust(width) for s in short))
-    for rec in downsample(intervals, rows):
+    for rec in downsample(src, rows):
         line = "  " + f"{rec['step']:>9,}"
         for k in keys:
             line += fmt(get(rec, k), width=width)

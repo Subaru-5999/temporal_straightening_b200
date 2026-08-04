@@ -500,3 +500,68 @@ def test_production_keys_still_detect_real_collapse(tmp_path):
     out = run_summariser(p)
     assert "COLLAPSE SIGNATURE" in out
     assert "NOT collapse" not in out
+
+
+# --------------------------------- sparse metrics must not alias out of the table
+def write_sparse_latents(path, n_intervals=475, log_every=200, diag_every=500):
+    """Mirror the live run: telemetry every 200 steps, diagnostics every 500.
+
+    Latent metrics therefore exist in only ~2 of every 5 interval records, which
+    is what let index-based downsampling select nothing but empty rows.
+    """
+    tl = TrainingLogger(path, run_name="sparse", log_every=log_every)
+    for step in range(1, n_intervals * log_every + 1):
+        tl.record(step, **{"loss/z_visual_loss": 1.0 / (1 + step / 1000)})
+        if step % diag_every == 0:
+            tl.probe_latents(step, {
+                "latent/probe_r2": 0.30,
+                "latent/latent_eff_rank_frac": 0.35,
+                "latent/latent_std": 0.38,
+            })
+        tl.maybe_flush(step)
+    tl.close(n_intervals * log_every, status="completed")
+
+
+def test_sparse_latent_table_is_not_all_dashes(tmp_path):
+    """The regression: 475 intervals, 22 rows, every row printed '-'."""
+    p = tmp_path / "sparse.jsonl"
+    write_sparse_latents(p)
+    out = run_summariser(p, "--metrics", "latent")
+    latent_block = out.split("## Latent health")[1].split("##")[0]
+    body = [l for l in latent_block.splitlines()
+            if l.strip() and "step" not in l and "intervals carry" not in l]
+    assert body, "latent table produced no rows at all"
+    populated_rows = [l for l in body if "0.3" in l]
+    assert populated_rows, f"every row was empty:\n{latent_block}"
+
+
+def test_sparse_table_reports_how_many_intervals_carry_the_metrics(tmp_path):
+    p = tmp_path / "sparse2.jsonl"
+    write_sparse_latents(p)
+    out = run_summariser(p, "--metrics", "latent")
+    assert "intervals carry these metrics" in out
+
+
+@pytest.mark.parametrize("n_intervals", [97, 200, 468, 475, 619])
+def test_no_aliasing_at_any_run_length(n_intervals):
+    """It worked at 468 intervals and broke at 475; sweep several lengths."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "s.jsonl")
+        write_sparse_latents(p, n_intervals=n_intervals)
+        out = run_summariser(p, "--metrics", "latent")
+        block = out.split("## Latent health")[1].split("##")[0]
+        assert "0.3" in block, f"aliased to empty rows at {n_intervals} intervals"
+
+
+def test_dense_metrics_table_unchanged(tmp_path):
+    """A section present in every interval must not gain the note line."""
+    p = tmp_path / "dense.jsonl"
+    tl = TrainingLogger(p, run_name="dense", log_every=10)
+    for step in range(1, 201):
+        tl.record(step, **{"loss/z_visual_loss": 1.0 / (1 + step)})
+        tl.maybe_flush(step)
+    tl.close(200)
+    out = run_summariser(p, "--metrics", "loss")
+    assert "intervals carry these metrics" not in out
