@@ -19,6 +19,7 @@ checkpoints
 !train_pusht_e2e_sigreg.sh
 !run_oracle_diag.sh
 !run_alpha_sweep.sh
+!run_diagnose_all.sh
 # Reference codebases are separate git clones -- committing them would create
 # broken gitlinks. Re-clone on demand:
 #   git clone https://github.com/lucas-maes/le-wm research_papers/le-wm
