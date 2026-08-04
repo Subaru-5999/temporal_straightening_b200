@@ -78,10 +78,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import hydra  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
-import custom_resolvers  # noqa: F401,E402
-from plan import load_model  # noqa: E402
+# hydra / plan.py / gym are imported lazily inside main() so the statistics below
+# can be imported and checked on a machine without the planning stack installed.
 
 
 # ---------------------------------------------------------------- statistics
@@ -289,6 +287,11 @@ def main():
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
+
+    import hydra
+    from omegaconf import OmegaConf
+    import custom_resolvers  # noqa: F401  (registers OmegaConf resolvers)
+    from plan import load_model
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     run = os.path.abspath(args.run.rstrip("/\\"))
