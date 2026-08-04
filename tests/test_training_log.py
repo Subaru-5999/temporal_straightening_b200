@@ -364,3 +364,68 @@ def test_header_only_log_is_not_an_error(tmp_path):
     assert out.returncode == 0
     assert "no interval records yet" in out.stdout
     assert "nonfinite" in out.stdout             # the events still surface
+
+
+# ------------------------------------------- verdict must not contradict itself
+def write_run(path, r2_first, r2_last, rank_first, rank_last, std_first, std_last,
+             loss_first=0.60, loss_last=0.02, n=400):
+    """Synthetic run with prescribed endpoints for the verdict inputs."""
+    tl = TrainingLogger(path, run_name="v", log_every=10)
+    for step in range(1, n + 1):
+        f = step / n
+        tl.record(step, **{"loss/z_visual_loss": loss_first + (loss_last - loss_first) * f})
+        if step % 50 == 0:
+            tl.probe_latents(step, {
+                "latent/probe_r2": r2_first + (r2_last - r2_first) * f,
+                "latent/eff_rank_frac": rank_first + (rank_last - rank_first) * f,
+                "latent/std": std_first + (std_last - std_first) * f,
+            })
+        tl.maybe_flush(step)
+    tl.close(n, status="completed")
+
+
+def test_real_collapse_still_reported(tmp_path):
+    """Loss falls, R^2 falls, rank and std fall too -> genuine collapse."""
+    p = tmp_path / "c.jsonl"
+    write_run(p, r2_first=0.85, r2_last=0.00,
+              rank_first=0.45, rank_last=0.13, std_first=0.39, std_last=0.002)
+    out = run_summariser(p)
+    assert "COLLAPSE SIGNATURE" in out
+    assert "healthy run looks like" not in out
+
+
+def test_reorganisation_is_not_called_collapse(tmp_path):
+    """The observed case: R^2 halves but rank and std RISE. Not collapse."""
+    p = tmp_path / "r.jsonl"
+    write_run(p, r2_first=0.35, r2_last=0.05,
+              rank_first=0.31, rank_last=0.38, std_first=0.35, std_last=0.39)
+    out = run_summariser(p)
+    assert "COLLAPSE SIGNATURE" not in out
+    assert "NOT collapse" in out
+    assert "reorganising" in out
+    assert "healthy run looks like" not in out
+
+
+def test_no_contradictory_verdict(tmp_path):
+    """The bug: a FAIL threshold line printed alongside 'healthy run looks like'.
+
+    R^2 0.2442 -> 0.1479 fails the >0.2 threshold but does not halve, which used
+    to satisfy the 'healthy' branch as well.
+    """
+    p = tmp_path / "x.jsonl"
+    write_run(p, r2_first=0.2442, r2_last=0.1479,
+              rank_first=0.31, rank_last=0.38, std_first=0.35, std_last=0.39)
+    out = run_summariser(p)
+    assert "FAIL" in out                          # threshold check still fails
+    assert "healthy run looks like" not in out    # ...and must not also say healthy
+    assert "NOT collapse" in out
+
+
+def test_healthy_run_still_reported(tmp_path):
+    p = tmp_path / "h.jsonl"
+    write_run(p, r2_first=0.60, r2_last=0.75,
+              rank_first=0.40, rank_last=0.45, std_first=0.35, std_last=0.40)
+    out = run_summariser(p)
+    assert "healthy run looks like" in out
+    assert "COLLAPSE SIGNATURE" not in out
+    assert "NOT collapse" not in out

@@ -163,16 +163,39 @@ def verdict(intervals):
         return
     tr_loss = trend(intervals, "loss/z_visual_loss") or trend(intervals, "loss/loss")
     tr_r2 = trend(intervals, "latent/probe_r2")
+    tr_rank = trend(intervals, "latent/eff_rank_frac") or trend(intervals, "latent/latent_eff_rank_frac")
+    tr_std = trend(intervals, "latent/std") or trend(intervals, "latent/latent_std")
     if tr_loss and tr_r2:
         loss_fell = tr_loss[1] < 0.5 * tr_loss[0]
         r2_fell = tr_r2[1] < 0.5 * max(tr_r2[0], 1e-9)
-        if loss_fell and r2_fell:
+        r2_degraded = tr_r2[1] < tr_r2[0]
+        # Collapse is variance AND rank AND decodability being bad together. Judge
+        # rank/std on their ABSOLUTE end state (same thresholds as the checks
+        # above), not just direction -- a run that starts collapsed and stays flat
+        # has nothing "falling" but is still collapsed. Rank or variance RISING
+        # while R^2 falls is the opposite signature: information is moving, not
+        # vanishing (e.g. out of the patch-mean this probe reads and into the
+        # spatial pattern across tokens).
+        rank_ok = tr_rank is None or tr_rank[1] >= 0.2
+        std_ok = tr_std is None or tr_std[1] >= 1e-3
+        rank_rose = tr_rank is not None and tr_rank[1] > tr_rank[0]
+        std_rose = tr_std is not None and tr_std[1] > tr_std[0]
+
+        if loss_fell and r2_fell and not (rank_ok and std_ok):
             print("\n  !! COLLAPSE SIGNATURE: the prediction loss fell while probe R^2")
-            print("     fell with it. The loss went down by making the representation")
-            print("     uninformative. This run is not usable.")
-        elif loss_fell and not r2_fell:
-            print("\n  Prediction loss fell while probe R^2 held: this is what a")
-            print("  healthy run looks like.")
+            print("     fell with it, and effective rank or latent std is degenerate.")
+            print("     The loss went down by making the representation uninformative.")
+            print("     This run is not usable.")
+        elif loss_fell and r2_degraded and rank_ok and std_ok and (rank_rose or std_rose):
+            print("\n  NOT collapse, but probe R^2 degraded while effective rank and")
+            print("  latent std ROSE. Collapse needs all three to fall together, so the")
+            print("  representation is reorganising rather than shrinking -- plausibly")
+            print("  moving information out of the patch-mean this probe reads. The")
+            print("  probe is a weak readout here (8 latent dims -> full state); treat")
+            print("  planning success as the decisive metric, not this number.")
+        elif loss_fell and not r2_degraded:
+            print("\n  Prediction loss fell while probe R^2 held or improved: this is")
+            print("  what a healthy run looks like.")
 
 
 def encoder_movement(intervals):
