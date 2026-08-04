@@ -242,18 +242,31 @@ def main():
         dp = out["pusher subspace removed"] - base
         dc = out["block subspace removed (control)"] - base
         dn = c - base
+        # An ABSOLUTE floor as well as a relative one. Without it, when every
+        # delta is ~0 (which is what a latent with no recoverable pusher
+        # subspace gives) the relative test fires on floating-point noise and
+        # reports a spurious effect. 0.01 = one point of cosine, ~20x the
+        # observed control/null perturbation.
+        EPS = 0.01
         print()
-        if dp > 0 and dp > max(abs(dc), abs(dn)) * 2:
+        if dp > EPS and dp > max(abs(dc), abs(dn)) * 2:
             print("  VERDICT: removing the pusher makes the latent trajectory")
             print("  STRAIGHTER, by more than the control and null perturbations.")
             print("  The curvature objective is minimised by discarding the pusher:")
             print("  the regularizer REWARDS the information loss that breaks")
             print("  planning. Cause, not symptom.")
-        elif dp <= max(abs(dc), abs(dn)):
-            print("  VERDICT: curvature is indifferent to the pusher (the effect is")
-            print("  within the control/null perturbation). The forgetting is driven")
-            print("  by the prediction loss exploiting proprio redundancy, not by the")
-            print("  curvature term.")
+        elif dp <= EPS:
+            print("  VERDICT: curvature is INDIFFERENT to the pusher -- removing it")
+            print(f"  changes cos by {dp:+.4f}, below the {EPS} threshold and on the")
+            print(f"  order of the control ({dc:+.4f}) and null ({dn:+.4f}).")
+            print("  The curvature term does not drive the forgetting. Look to the")
+            print("  prediction loss exploiting proprio redundancy instead.")
+            if abs(dp) < 1e-4 and out["dim"] < 5000:
+                print("  NOTE: on the TRAINED latent a null result is also expected for")
+                print("  a second reason -- there is no linearly recoverable pusher")
+                print("  subspace left to remove (probe R^2 is already ~0), so the")
+                print("  projection is fitted to noise. Only the pristine-DINOv2 row")
+                print("  answers the incentive question.")
         else:
             print("  VERDICT: weak effect in the predicted direction. Curvature mildly")
             print("  favours dropping the pusher but is not the dominant driver.")
