@@ -7,6 +7,16 @@ from einops import rearrange, repeat
 
 log = logging.getLogger(__name__)
 
+
+def _proprio_in_dim(proprio_encoder):
+    """Raw proprio observation width, unwrapping an accelerate/DDP wrapper."""
+    for mod in (proprio_encoder, getattr(proprio_encoder, "module", None)):
+        dim = getattr(mod, "in_chans", None)
+        if dim:
+            return int(dim)
+    return None
+
+
 class VWorldModel(nn.Module):
     def __init__(
         self,
@@ -38,6 +48,7 @@ class VWorldModel(nn.Module):
         sigreg_num_proj=1024,
         sigreg_knots=17,
         sigreg_apply_to="agg",
+        ground_proprio=0.0,
         **kwargs,
     ):
         super().__init__()
@@ -157,16 +168,71 @@ class VWorldModel(nn.Module):
         assert concat_dim == 0 or concat_dim == 1, f"concat_dim {concat_dim} not supported."
         log.info("Model emb_dim: %s", self.emb_dim)
 
+        self._num_patches = None
         if "dino" in self.encoder.name:
             decoder_scale = 16  # from vqvae
             num_side_patches = image_size // decoder_scale
             self.encoder_image_size = num_side_patches * encoder.patch_size
+            # the encoder sees encoder_image_size pixels at patch_size stride, so
+            # the token grid is num_side_patches on a side
+            self._num_patches = num_side_patches * num_side_patches
             self.encoder_transform = transforms.Compose(
                 [transforms.Resize(self.encoder_image_size)]
             )
         else:
             # set self.encoder_transform to identity transform
             self.encoder_transform = lambda x: x
+
+        # ---- proprio grounding: keep the pusher IN the visual latent ----------
+        # Diagnosed failure (PushT, end-to-end + SIGReg, see PROGRESS_SIGREG_E2E.md):
+        # the visual latent stopped representing the agent/pusher (held-out probe
+        # R^2 0.943 -> -0.011) while KEEPING the block (0.945 -> 0.979). The
+        # information was not destroyed, it moved: z's proprio channels carry the
+        # agent at R^2 0.997. Because the prediction loss is taken on the
+        # concatenated z, the visual tokens are never required to encode anything
+        # the proprio channels already provide, and dropping it lowers the loss.
+        # SIGReg constrains only the distribution and the curvature term only the
+        # direction, so neither forbids it. With a frozen trunk it cannot happen.
+        #
+        # The consequence is fatal for planning but invisible in training metrics:
+        # in PushT the action IS the pusher target, so a cost dominated by the
+        # visual channel cannot tell whether the pusher went where it was sent.
+        # Both GD and CEM converge to an identical 0.26 success rate on that
+        # checkpoint, while the ground-truth actions score 1.0 -- the optimiser is
+        # fine, the cost's optimum is simply in the wrong place.
+        #
+        # This term closes the loophole: a LINEAR read-out of the visual tokens
+        # must reproduce the proprio observation. Linear on purpose -- the planning
+        # cost is Euclidean on those tokens, so information that is only
+        # non-linearly decodable would not make the cost sensitive to the pusher.
+        # The target is an existing model INPUT, not a new label.
+        self.ground_coeff = float(ground_proprio)
+        self.ground_head = None
+        if self.ground_coeff > 0:
+            if self._num_patches is None:
+                raise ValueError(
+                    "ground_proprio > 0 requires an encoder with a known patch "
+                    "count (a DINOv2 patch-token encoder); got "
+                    f"{getattr(self.encoder, 'name', type(self.encoder).__name__)!r}."
+                )
+            # The head is built here, not lazily on the first forward, because the
+            # optimizers are constructed before any forward pass. Both sizes are
+            # therefore read from the modules: the token count and channel width
+            # from the encoder, the target width from the proprio encoder's input.
+            target_dim = _proprio_in_dim(self.proprio_encoder)
+            if not target_dim:
+                raise ValueError(
+                    "ground_proprio > 0 needs the proprio encoder to expose its "
+                    "input width (`in_chans`); use proprio_encoder=proprio."
+                )
+            in_features = self._num_patches * self.encoder.emb_dim
+            self.ground_head = nn.Linear(in_features, target_dim)
+            log.info(
+                "Proprio grounding enabled: coeff=%s, linear head %d -> %d",
+                self.ground_coeff, in_features, target_dim,
+            )
+        else:
+            log.info("Proprio grounding disabled")
 
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
@@ -370,6 +436,28 @@ class VWorldModel(nn.Module):
 
         return self._cos_curvature(v1, v2)
 
+    def proprio_grounding_loss(self, z, proprio):
+        """MSE of a linear read-out of the visual tokens against the proprio obs.
+
+        Args:
+            z: (b, t, p, d_total) the full concatenated latent.
+            proprio: (b, t, d_proprio) the raw (normalised) proprio observation,
+                i.e. an existing model input rather than a new label.
+        """
+        feats = self.visual_only(z)                    # (b, t, p, d)
+        b, t = feats.shape[0], feats.shape[1]
+        flat = feats.reshape(b, t, -1)
+        if flat.shape[-1] != self.ground_head.in_features:
+            raise ValueError(
+                f"grounding head expects {self.ground_head.in_features} visual "
+                f"features ({self._num_patches} tokens x {self.encoder.emb_dim} "
+                f"channels) but the latent has {flat.shape[-1]}. The token count "
+                "is derived as (image_size // 16) ** 2; an encoder with a "
+                "different token grid needs that made explicit."
+            )
+        pred = self.ground_head(flat)
+        return F.mse_loss(pred, proprio[:, : pred.shape[1]].to(pred.dtype))
+
     def sigreg_loss(self, feats):
         """SIGReg on the visual latents.
 
@@ -469,6 +557,17 @@ class VWorldModel(nn.Module):
                 curvature_loss = self.total_curvature(feats, mode=self.curvature_mode)
                 loss = loss + curvature_loss * self.straighten_scale
                 loss_components["curvature_loss_used_for_training"] = curvature_loss
+
+            # Require the VISUAL tokens alone to linearly reproduce the proprio
+            # observation, so the encoder cannot offload the agent's position onto
+            # z's proprio channels and stop representing it. See __init__.
+            if self.ground_head is not None:
+                ground_loss = self.proprio_grounding_loss(z, obs["proprio"])
+                loss = loss + ground_loss * self.ground_coeff
+                loss_components["ground_proprio_loss"] = ground_loss
+                loss_components["ground_proprio_loss_scaled"] = (
+                    ground_loss * self.ground_coeff
+                )
         else:
             visual_pred = None
             z_pred = None

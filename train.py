@@ -512,6 +512,7 @@ class Trainer:
             vcreg_std_coeff=self.cfg.training.get("vcreg_std_coeff", 0),
             vcreg_cov_coeff=self.cfg.training.get("vcreg_cov_coeff", 0),
             vcreg_apply_to=self.cfg.training.get("vcreg_apply_to", "enc"),
+            ground_proprio=self.cfg.training.get("ground_proprio", 0.0),
             sigreg=self.cfg.training.get("sigreg", False),
             sigreg_coeff=self.cfg.training.get("sigreg_coeff", 0.0),
             sigreg_num_proj=self.cfg.training.get("sigreg_num_proj", 1024),

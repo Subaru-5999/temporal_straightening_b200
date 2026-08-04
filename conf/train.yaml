@@ -67,6 +67,27 @@ training:
   sigreg_num_proj: 1024    # M random 1-D projections (LeWM: 1024)
   sigreg_knots: 17         # quadrature nodes for the Epps-Pulley integral
   sigreg_apply_to: agg     # agg (pooled trajectory repr) | patch (per-token)
+
+  # ---- proprio grounding: keep the agent IN the visual latent ----------------
+  # Coefficient of a linear read-out loss forcing the visual tokens alone to
+  # reproduce the proprio observation. 0.0 = off (default, every tracked run
+  # unchanged).
+  #
+  # Why it exists. On the PushT end-to-end + SIGReg run the visual latent stopped
+  # representing the agent/pusher (held-out probe R^2 0.943 -> -0.011) while
+  # keeping the block (0.945 -> 0.979). The information moved rather than
+  # vanishing: z's proprio channels hold the agent at R^2 0.997. The prediction
+  # loss is taken on the concatenated z, so the visual tokens are never required
+  # to encode what the proprio channels already supply, and dropping it lowers the
+  # loss. SIGReg constrains only the distribution, curvature only the direction.
+  # A frozen trunk cannot do this, which is why the baseline never showed it.
+  #
+  # It is fatal for planning and invisible in training metrics: in PushT the action
+  # IS the pusher target, so a visual-dominated cost cannot tell whether the pusher
+  # arrived. On that checkpoint GD and CEM both converge to exactly 0.26 while the
+  # ground-truth actions score 1.0 -- the optimiser is fine, the cost's optimum is
+  # in the wrong place. See PROGRESS_SIGREG_E2E.md.
+  ground_proprio: 0.0
   # Fine-tune the pretrained visual trunk (DINOv2). False = end-to-end JEPA.
   # True (default) reproduces the original behaviour, where the trunk was frozen
   # unconditionally regardless of model.train_encoder.
