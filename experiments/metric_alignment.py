@@ -113,20 +113,32 @@ def held_out_r2(X, Y, ridge=1e-3):
     Interleaved even/odd split so both halves span the sample, and the fit is
     scored on data it never saw -- an in-sample probe on a 1568-dim latent from
     a few hundred rows returns 1.0 and means nothing.
+
+    Solved in whichever space is smaller. The primal normal equations are
+    (D+1)x(D+1), and D is 196*384 = 75,264 for pristine DINOv2 patch tokens,
+    i.e. a 45 GB float64 Gram matrix. The dual form
+        pred_held = K_hf (K_ff + ridge I)^-1 Y_fit,   K = X X^T
+    is the SAME ridge estimator at n_fit x n_fit, a few hundred squared. Use it
+    whenever D >= n_fit, which is every high-dimensional representation here.
     """
     X = torch.as_tensor(X, dtype=torch.float64)
     Y = torch.as_tensor(Y, dtype=torch.float64)
     X = torch.cat([X, torch.ones(X.shape[0], 1, dtype=X.dtype)], dim=1)
     fit, held = X[0::2], X[1::2]
     yf, yh = Y[0::2], Y[1::2]
-    if fit.shape[0] < 4 or held.shape[0] < 4:
+    n_fit, d = fit.shape
+    if n_fit < 4 or held.shape[0] < 4:
         return float("nan"), []
-    gram = fit.T @ fit + ridge * torch.eye(fit.shape[1], dtype=X.dtype)
     try:
-        W = torch.linalg.lstsq(gram, fit.T @ yf).solution
+        if d >= n_fit:
+            k_ff = fit @ fit.T + ridge * torch.eye(n_fit, dtype=X.dtype)
+            alpha = torch.linalg.solve(k_ff, yf)
+            pred = (held @ fit.T) @ alpha
+        else:
+            gram = fit.T @ fit + ridge * torch.eye(d, dtype=X.dtype)
+            pred = held @ torch.linalg.lstsq(gram, fit.T @ yf).solution
     except Exception:
         return float("nan"), []
-    pred = held @ W
     ss_res = ((pred - yh) ** 2).sum(0)
     ss_tot = ((yh - yh.mean(0, keepdim=True)) ** 2).sum(0)
     per = [float(v) for v in (1 - ss_res / ss_tot.clamp_min(1e-12)).clamp(-1, 1)]
@@ -271,6 +283,13 @@ def main():
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
+    # Piping into tee makes stdout block-buffered, so a long CPU run looks hung
+    # while only stderr warnings appear. Line-buffer instead of relying on -u.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     run = os.path.abspath(args.run.rstrip("/\\"))
     cfg = OmegaConf.load(os.path.join(run, "hydra.yaml"))
@@ -300,6 +319,7 @@ def main():
     res = {}
     tf = model.encoder_transform
 
+    print("encoding with the trained encoder...")
     Zv = encode_all(model.encoder, tf, vis, device)
     res["method.visual_patch"] = analyse("method: visual patch tokens (the planning latent)",
                                         Zv, S, rng, args.pairs, state_names)
@@ -311,8 +331,8 @@ def main():
 
     if hasattr(model.encoder, "agg"):
         with torch.no_grad():
-            p = int(np.sqrt(Zv.shape[1] // model.encoder.emb_dim)) ** 2
-            d = Zv.shape[1] // max(p, 1)
+            d = int(model.encoder.emb_dim)          # per-patch channels after projection
+            p = Zv.shape[1] // d                    # number of patches
             za = torch.as_tensor(Zv, dtype=torch.float32).reshape(-1, p, d).to(device)
             Za = model.encoder.agg(za).float().cpu().numpy()
         res["method.agg"] = analyse("method: agg head (what SIGReg + curvature act on)",
@@ -322,6 +342,7 @@ def main():
         from models.dino import DinoV2Encoder
         print("\n--- reference: pristine DINOv2 from the hub cache (untrained geometry) ---")
         ref = DinoV2Encoder("dinov2_vits14", "x_norm_patchtokens").to(device).eval()
+        print("encoding with pristine DINOv2 (75,264-dim patch tokens)...")
         Zr = encode_all(ref, tf, vis, device)
         res["reference.dinov2_patch"] = analyse("reference: pristine DINOv2 patch tokens",
                                                Zr, S, rng, args.pairs, state_names)
