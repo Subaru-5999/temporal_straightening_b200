@@ -52,6 +52,25 @@ echo "log                    = ${LOG}"
 echo
 
 # --- pre-flight: the 45 GB MIG slice holds exactly one job ---
+# This is a HARD GATE, not a printout. Launching a 12 h training run on top of a
+# live plan.py has happened repeatedly: the eval holds ~41 GB of the 45 GB slice,
+# so training either OOMs on the spot or trips the allocator's NVML assert and
+# takes the eval down with it. Refuse instead. FORCE=1 overrides.
+BUSY=""
+for pat in "[t]rain.py --config-name" "[p]lan.py --config-name" "[r]eproduce_table1.py"; do
+  hits=$(pgrep -af "$pat" || true)
+  [ -n "$hits" ] && BUSY="${BUSY}${hits}"$'\n'
+done
+if [ -n "${BUSY}" ] && [ "${FORCE:-0}" != "1" ]; then
+  echo "REFUSING TO START: the MIG slice already has a job." >&2
+  echo "${BUSY}" >&2
+  echo "Wait for it, or chain on its PID:" >&2
+  echo "  setsid nohup bash -c 'while kill -0 <PID> 2>/dev/null; do sleep 60; done;" \
+       "sleep 45; bash $(basename "$0")' > train_queue.log 2>&1 < /dev/null &" >&2
+  echo "Override with FORCE=1 only if you know the slice is free." >&2
+  exit 1
+fi
+
 echo "== stray python processes (kill -9 anything left over) =="
 ps -eo pid,etime,rss,cmd | grep -i python | grep -v grep || echo "  none"
 echo "== MIG memory (want a few MiB used, not ~41 GB) =="

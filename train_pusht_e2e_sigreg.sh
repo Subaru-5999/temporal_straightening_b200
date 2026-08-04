@@ -74,6 +74,19 @@ echo "log             = ${LOG}"
 echo
 
 # --- pre-flight: the 45 GB MIG slice holds exactly one job ---
+# HARD GATE, not a printout -- see train_pusht_on_paperiters.sh for why.
+BUSY=""
+for pat in "[t]rain.py --config-name" "[p]lan.py --config-name" "[r]eproduce_table1.py"; do
+  hits=$(pgrep -af "$pat" || true)
+  [ -n "$hits" ] && BUSY="${BUSY}${hits}"$'\n'
+done
+if [ -n "${BUSY}" ] && [ "${FORCE:-0}" != "1" ]; then
+  echo "REFUSING TO START: the MIG slice already has a job." >&2
+  echo "${BUSY}" >&2
+  echo "Chain on its PID instead, or set FORCE=1 if you know the slice is free." >&2
+  exit 1
+fi
+
 echo "== stray python processes (kill -9 anything left over) =="
 ps -eo pid,etime,rss,cmd | grep -i python | grep -v grep || echo "  none"
 echo "== MIG memory (want a few MiB used, not ~41 GB) =="
