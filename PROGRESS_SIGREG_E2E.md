@@ -413,3 +413,69 @@ visual velocity probes land at +0.326 / −0.795. At coefficient 1.0 grounding i
   probe that trains slower than the representation it reads gives a stale gradient.
 - `ground_proprio` had to enter `run_naming.variant_tag()` or a grounded run
   resolves to the ungrounded directory and auto-resumes it.
+
+---
+
+# Comparability contract (baseline vs ours)
+
+The headline comparison is the paper's ✓ PushT cell against our end-to-end
+variant. For that to mean anything, **only the contribution may differ.**
+
+Reference baseline: `pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgTrue_lr1e-05`,
+produced by `train_pusht_on_paperiters.sh` with no edits (the repo defaults
+`freeze_backbone: True`, `stop_grad: True`, `sigreg: False`, `ground_proprio: 0`,
+`backbone_lr: null` give exactly this, and `variant_tag` resolves to `''`).
+Paper targets: OL 77.33 ± 6.18, MPC 85.33 ± 4.99.
+
+## Intended differences — exactly four
+
+| setting | baseline | ours |
+|---|---|---|
+| `freeze_backbone` | True | False |
+| `stop_grad` | True | False |
+| `sigreg` / `sigreg_coeff` | False / 0 | True / 0.1 |
+| `ground_proprio` | 0 | 1.0 |
+
+## Must match — verified from both runs' telemetry configs
+
+`straighten=aggcos1e-1`, `encoder_lr=1e-5`, `predictor_lr=5e-4`,
+`action_encoder_lr=5e-4`, `batch_size=32`, `num_hist=3`, `num_pred=1`,
+`frameskip=5`, `max_iterations=123858`, `epochs=3` (so the cap ends the run),
+`encoder=dino_channel` (projector 14x14x8), `training.seed=0`.
+
+Pass `BACKBONE_LR=null` on the full grounded run. `null` and `1e-5` are
+numerically identical here (both put the trunk at `encoder_lr`), but matching the
+config literally removes a question a reviewer would otherwise ask.
+
+## Eval protocol — identical for both arms, no exceptions
+
+Open-loop `plan_gd.yaml`: 50 samples, `goal_H=25` -> 5 model steps, GD with Adam
+lr 0.1, 100 steps, zero init, `action_noise=0`, `mode=last`. MPC
+`plan_gd_mpc.yaml`: `max_iter=20`, `n_taken_actions=5`, `mode=staged`. PushT uses
+**alpha=1**. Seeds 100/200/300. `objective.normalize=false`.
+
+Run both arms through `reproduce_table1.py <run_name>`, which applies the alpha,
+mode, seeds and env recipe internally, rather than hand-rolled `plan.py` calls
+that can drift between arms.
+
+## Numbers that must NOT be reported as protocol results
+
+- **e2e ungrounded = 13.33 ± 1.15, not 26.0.** The 26.0 came from alpha=240,
+  which is off-protocol. It is a diagnostic that identified the weighting defect,
+  not a result.
+- **alpha must not be tuned per model.** alpha=240 helps the ungrounded model and
+  *hurts* the grounded one (0.20 -> 0.14), so per-model best-alpha would compare
+  two different objectives. alpha=1 is both the paper's setting and the grounded
+  model's best, so no deviation is needed.
+- **`objective.normalize=true` stays off in the headline.** It is a diagnostic and
+  a fairness tool for cross-scale comparisons; if it is ever used it must be
+  applied to both arms.
+
+## Run queue (one MIG slice, strictly serial)
+
+1. position-only pilot checks (~12 min) -> pick the grounding config
+2. full 123,858-step grounded run at that config (~14 h)
+3. `train_pusht_on_paperiters.sh` frozen ✓ baseline (~14 h) -- its checkpoint is
+   gone from the pod, so `REPRODUCTION.md`'s recorded 76.00/82.00 covers PushT at
+   H=5 but cannot be re-evaluated at long horizon or under any protocol variant
+4. `reproduce_table1.py` on both, 3 seeds, open-loop + MPC
