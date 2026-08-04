@@ -139,6 +139,60 @@ if want 4; then
   wait_for_slice; plan O_opt1000 objective.alpha=1 planner.sub_planner.opt_steps=1000
 fi
 
+# ------------------------------------------------------------------ STAGE 5
+if want 5; then
+  echo
+  echo "################ STAGE 5: IS THE PLANNER EXPLOITING THE MODEL? ################"
+  echo "# Stage 3 result: alpha 0/1/50/240/1400/1e5 -> 0.12/0.12/0.24/0.26/0.16/0.00."
+  echo "# Reweighting doubles it and saturates, so weighting was an amplifier, not"
+  echo "# the binding constraint. Meanwhile H_oracle=1.0 (task-optimal actions exist"
+  echo "# and work open-loop), beat=0.065 (6.5% of REAL action sequences already"
+  echo "# score lower cost than those optimal actions) and visual snr=2.91 (the"
+  echo "# controllable signal is 2.9x the rollout-error floor)."
+  echo "#"
+  echo "# That combination says GD is minimising the cost correctly and the cost is"
+  echo "# wrong: 100 Adam steps over 50 free parameters find off-manifold actions"
+  echo "# the model believes reach the goal. Two tests, either of which is decisive."
+
+  echo
+  echo "--- 5a: success vs GD steps, at the best alpha ---"
+  echo "# eval_every makes the GD planner evaluate in the REAL env during"
+  echo "# optimisation, so one job yields the whole curve. If success PEAKS EARLY"
+  echo "# and then DECLINES as the cost keeps falling, the planner is provably"
+  echo "# optimising against model error rather than task progress. A monotone"
+  echo "# rise instead means the cost is sound and the budget is the limit."
+  wait_for_slice
+  plan X_steps_curve objective.alpha=240 planner.sub_planner.eval_every=10
+
+  echo
+  echo "--- 5b: CEM on the SAME checkpoint ---"
+  echo "# CEM samples inside the action distribution and structurally cannot"
+  echo "# exploit off-manifold gradient directions. If CEM >> GD's 0.26 on this"
+  echo "# very model, the representation is adequate and the PLANNER is the"
+  echo "# failure -- which is exactly the claim the submission rests on, since"
+  echo "# LeWM plans with CEM and we are proposing to replace it with GD."
+  wait_for_slice
+  echo "=== C_cem_alpha240 ==="
+  python plan.py --config-name plan_cem.yaml ckpt_base_path="$RUN" \
+    model_name="$METHOD" model_epoch=latest decode_for_viz=false seed=100 \
+    objective.alpha=240 objective.mode=last \
+    hydra.run.dir="plan_diag/C_cem_alpha240" 2>&1 \
+    | grep -E "Success rate|Error executing|OutOfMemory|Traceback"
+
+  echo
+  echo "--- 5c: does a trust region help GD? ---"
+  echo "# If 5a declines, the cheap mitigation is to stop before the exploit:"
+  echo "# fewer steps, and AdamW weight decay pulling actions toward the zero-init"
+  echo "# prior so the search cannot wander off-distribution."
+  for st in 10 25; do
+    wait_for_slice
+    plan "X_steps$st" objective.alpha=240 "planner.sub_planner.opt_steps=$st"
+  done
+  wait_for_slice
+  plan X_trustregion objective.alpha=240 \
+    planner.sub_planner.optimizer=adamw planner.sub_planner.adamw_weight_decay=0.1
+fi
+
 cat <<'EOF'
 
 ################ DECISION TABLE ################
@@ -169,6 +223,22 @@ cat <<'EOF'
           O_descent ~ H_oracle       -> the cost is fine locally; zero-init lands
                                         in a bad basin. Cheapest fix of all.
           O_randn / O_opt1000 >> A1  -> search budget / initialisation.
+
+ STAGE 5  5a peaks early then falls  -> MODEL EXPLOITATION. GD minimises the cost
+                                        correctly; the cost stops tracking the
+                                        task past some step count. Fix the
+                                        planner (trust region / early stop), and
+                                        note that CEM hides this, which is why
+                                        LeWM never hit it.
+          5a rises monotonically     -> the cost is sound; the ceiling is the
+                                        representation, not the search.
+          5b CEM >> 0.26             -> the model is adequate and GD is the
+                                        failure. This is the central obstacle for
+                                        a paper whose contribution is GD-for-JEPA.
+          5b CEM ~= 0.26             -> the model itself cannot support planning
+                                        at this horizon. Retraining is required;
+                                        no planner-side fix will do.
+          5c short/trust-region > A240 -> a cheap planner-side mitigation exists.
 
 EOF
 echo "############ DIAGNOSIS DONE $(date) ############"
