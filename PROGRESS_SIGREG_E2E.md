@@ -479,3 +479,64 @@ that can drift between arms.
    gone from the pod, so `REPRODUCTION.md`'s recorded 76.00/82.00 covers PushT at
    H=5 but cannot be re-evaluated at long horizon or under any protocol variant
 4. `reproduce_table1.py` on both, 3 seeds, open-loop + MPC
+
+---
+
+# Position-only grounding: better representation, much worse planning
+
+`ground_proprio_dims=[0,1]` (agent position only, dropping the two velocity
+targets that a single frame cannot determine), 8,000 steps, otherwise identical.
+
+| | ungrounded | all-dims | position-only |
+|---|---|---|---|
+| `ground_proprio_loss` | — | 0.2324 (plateau) | **0.0107** |
+| `z_loss` | 0.0060 @6k | 0.0118 @4k | **0.0042 @8k** |
+| curvature (1−cos) | 0.4109 @6k | 0.6726 @4k | **0.4199 @8k** |
+| agent_x / agent_y | −0.011 / −0.618 | 0.991 / 0.993 | **0.997 / 0.994** |
+| block_x / block_y | 0.979 / 0.989 | 0.930 / 0.899 | **0.974 / 0.905** |
+| block_angle | 0.622 | 0.514 | **0.756** (> pristine 0.732) |
+| vel_x / vel_y | −1.0 / −1.0 | **+0.326** / −0.795 | −0.680 / −1.0 |
+| `rho_global` | 0.695 | 0.552 | **0.732** |
+| visual `snr` @k=5 | 2.91 | **3.21** | **1.09** |
+| visual `beat` | 0.065 | **0.019** | **0.140** |
+| **success, 3 seeds, α=1** | 13.33 ± 1.15 | **20.67 ± 1.15** | **7.33 ± 4.16** |
+
+Every mechanical prediction for position-only came true — grounding loss to 0.01,
+curvature recovered 0.67 → 0.42, prediction better than ungrounded, block and
+angle recovered — and success **collapsed** to 7.33 (≈5σ below all-dims).
+
+## What this establishes
+
+**1. `snr` and `beat` predict planning success; static probe R² does not.**
+Across three independently trained models the ordering is monotone on both:
+
+    snr   1.09  <  2.91  <  3.21
+    beat  0.140 >  0.065 >  0.019
+    succ  7.33  <  13.33 <  20.67
+
+Position-only had the BEST probe R² on every state dimension and the worst
+planning. Measure **action sensitivity**, not state decodability.
+`experiments/rollout_drift.py` gives both in ~3 GPU-minutes with no environment.
+
+**2. Grounding on velocity is a feature, not a defect.** Velocity is the
+derivative of position, i.e. the quantity actions control most directly.
+Requiring the visual latent to predict it — even though one frame does not
+determine it — pushes the encoder toward motion-sensitive features, which is
+what makes the terminal latent respond to a change in the action sequence.
+Removing it dropped `snr` to 1.09: the action's effect on the terminal latent
+became the same size as the rollout error, so the cost surface is noise at the
+scale being optimised, and `beat` rose 7x.
+
+The "ill-posed target" objection was wrong. It acts as a dynamics-aware
+regulariser: bad for static decodability, good for planning.
+
+**3. Grounding repairs the scale imbalance by itself.** Proprio spread rose 9x
+(0.00109 → 0.0097), so `alpha_eff` went 0.0042 → 0.039 with no change to α. That
+is why α=240 helps the ungrounded model and hurts the grounded one, and why
+`objective.normalize` is no longer needed once grounding is on.
+
+## Decision
+
+Full 123,858-step run uses **all four proprio dims at `ground_proprio=1.0`**,
+`BACKBONE_LR=null` to match the ungrounded config literally, α=1 per the
+comparability contract.
