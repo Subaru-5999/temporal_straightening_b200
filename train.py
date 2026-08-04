@@ -553,9 +553,39 @@ class Trainer:
             groups.append({"params": heads, "lr": enc_lr})
         return groups
 
+    def _register_ground_head(self, groups):
+        """Place the proprio-grounding head on the device and into an optimizer.
+
+        VWorldModel is built AFTER accelerator.prepare() and is never itself
+        prepared, so a module created in its __init__ keeps CPU parameters that
+        no optimizer owns. SIGReg only has buffers and relocates them per call;
+        the grounding head has parameters, so it needs both fixes or the run
+        dies on the first forward with a device mismatch and the head never
+        learns.
+
+        It gets action_encoder_lr rather than encoder_lr: it is a read-out probe,
+        and a probe that trains slower than the representation it reads supplies
+        a stale gradient to the encoder. Appended LAST so the trunk/head group
+        indices that _probe_module_health relies on keep their meaning.
+        """
+        head = getattr(self.model, "ground_head", None)
+        self._n_encoder_groups = len(groups)
+        if head is None:
+            return groups
+        head.to(self.accelerator.device)
+        lr = self.cfg.training.action_encoder_lr
+        log.info(
+            "Grounding head: %s params @ lr=%s, on %s (not checkpointed: it is a "
+            "training-only read-out and relearns in a few hundred steps, so a "
+            "resume shows a brief transient in ground_proprio_loss)",
+            f"{sum(p.numel() for p in head.parameters()):,}", lr,
+            self.accelerator.device,
+        )
+        return list(groups) + [{"params": list(head.parameters()), "lr": lr}]
+
     def init_optimizers(self):
         self.encoder_optimizer = torch.optim.Adam(
-            self._encoder_param_groups(),
+            self._register_ground_head(self._encoder_param_groups()),
             lr=self.cfg.training.encoder_lr,
         )
         self.encoder_optimizer = self.accelerator.prepare(self.encoder_optimizer)
@@ -756,8 +786,10 @@ class Trainer:
         try:
             lrs = {}
             enc_groups = self.encoder_optimizer.param_groups
-            # _encoder_param_groups puts the trunk first when backbone_lr is set
-            if len(enc_groups) > 1:
+            # _encoder_param_groups puts the trunk first when backbone_lr is set.
+            # Count the ENCODER groups only: the grounding head is appended after
+            # them, and counting it would mislabel a single-group encoder's lr.
+            if getattr(self, "_n_encoder_groups", len(enc_groups)) > 1:
                 lrs["encoder.trunk"] = enc_groups[0]["lr"]
                 lrs["encoder.projector"] = enc_groups[1]["lr"]
                 lrs["encoder.agg_mlp"] = enc_groups[1]["lr"]
