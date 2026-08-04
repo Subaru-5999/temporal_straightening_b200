@@ -429,3 +429,74 @@ def test_healthy_run_still_reported(tmp_path):
     assert "healthy run looks like" in out
     assert "COLLAPSE SIGNATURE" not in out
     assert "NOT collapse" not in out
+
+
+# ------------------------------------ the verdict must read the LIVE key names
+def production_latent_keys():
+    """Exactly the keys train.py feeds to probe_latents, derived not hardcoded.
+
+    models.diagnostics.latent_diagnostics(prefix="val_") emits e.g.
+    'val_latent_eff_rank_frac'; train.py then strips only the 'val_' prefix and
+    prepends 'latent/', giving 'latent/latent_eff_rank_frac'. Deriving them here
+    means this test cannot drift from the trainer.
+    """
+    import torch as _t
+
+    from models.diagnostics import latent_diagnostics
+
+    diag = latent_diagnostics(_t.randn(8, 4, 8), state=_t.randn(8, 4, 3), prefix="val_")
+    return ["latent/" + k.replace("val_", "", 1) for k in diag]
+
+
+def test_production_key_names_are_what_we_expect():
+    keys = production_latent_keys()
+    assert "latent/probe_r2" in keys
+    assert "latent/latent_eff_rank_frac" in keys      # NOT latent/eff_rank_frac
+    assert "latent/latent_std" in keys                # NOT latent/std
+
+
+def test_verdict_uses_the_production_keys(tmp_path):
+    """Regression: the fix relied on a fallback, and the tests only covered the
+    other branch. Write the real key names and check the verdict still fires."""
+    p = tmp_path / "prod.jsonl"
+    tl = TrainingLogger(p, run_name="prod", log_every=10)
+    n = 400
+    for step in range(1, n + 1):
+        f = step / n
+        tl.record(step, **{"loss/z_visual_loss": 0.60 - 0.58 * f})
+        if step % 50 == 0:
+            tl.probe_latents(step, {
+                # the observed live run: R^2 down, rank and std UP
+                "latent/probe_r2": 0.2442 - 0.0963 * f,
+                "latent/latent_eff_rank_frac": 0.31 + 0.07 * f,
+                "latent/latent_std": 0.35 + 0.04 * f,
+            })
+        tl.maybe_flush(step)
+    tl.close(n, status="completed")
+
+    out = run_summariser(p)
+    assert "NOT collapse" in out
+    assert "reorganising" in out
+    assert "healthy run looks like" not in out
+    assert "COLLAPSE SIGNATURE" not in out
+
+
+def test_production_keys_still_detect_real_collapse(tmp_path):
+    p = tmp_path / "prodc.jsonl"
+    tl = TrainingLogger(p, run_name="prodc", log_every=10)
+    n = 400
+    for step in range(1, n + 1):
+        f = step / n
+        tl.record(step, **{"loss/z_visual_loss": 0.60 - 0.58 * f})
+        if step % 50 == 0:
+            tl.probe_latents(step, {
+                "latent/probe_r2": 0.85 * (1 - f),
+                "latent/latent_eff_rank_frac": 0.45 - 0.32 * f,   # ends 0.13 < 0.2
+                "latent/latent_std": 0.39 * (1 - f) + 0.0005,
+            })
+        tl.maybe_flush(step)
+    tl.close(n, status="completed")
+
+    out = run_summariser(p)
+    assert "COLLAPSE SIGNATURE" in out
+    assert "NOT collapse" not in out
