@@ -37,6 +37,11 @@ objective:
   alpha: 0
   base: 2 
   mode: last
+  # Divide each channel's term by its own spread so `alpha` is a true relative
+  # weight. Needed once the encoder is trained end-to-end: the channel scales
+  # then diverge and a fixed alpha silently becomes alpha * scale_p/scale_v.
+  # false keeps every tracked run byte-identical. See planning/objectives.py.
+  normalize: false
 
 planner:
   _target_: planning.mpc.MPCPlanner

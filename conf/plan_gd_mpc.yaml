@@ -37,6 +37,8 @@ objective:
   alpha: 0
   base: 2 
   mode: all
+  # See planning/objectives.py. false keeps every tracked run byte-identical.
+  normalize: false
 
 planner:
   _target_: planning.mpc.MPCPlanner

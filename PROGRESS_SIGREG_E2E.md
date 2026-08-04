@@ -250,3 +250,91 @@ Ordered by value.
 - **Two-codebase split.** The method is implemented here (unfreezing DINOv2)
   rather than in LeWM (ViT-tiny from scratch), so the "no pretrained backbone"
   claim is the weaker version. Decide which repo hosts the submission.
+
+---
+
+# Diagnosis of the PushT open-loop failure (closed)
+
+**Result being explained.** PushT, end-to-end + SIGReg + straightening, paper-exact
+budget (123,858 steps): open-loop **13.33 ± 1.15** (seeds 12/14/14), MPC **56.0**
+(seed 100). Paper's frozen ✓ cell: 77.33 ± 6.18 / 85.33 ± 4.99. Same-pod frozen ✗
+reproduction (`REPRODUCTION.md` row 4): 76.00 ± 3.27 / 82.00 ± 4.32.
+
+## Conclusion
+
+**Information was not lost from `z`. It was redistributed between the channels of
+`z`, and the planning objective has hard-coded relative weights.**
+
+End-to-end training let the visual encoder stop representing the pusher, because
+the pusher is redundantly available in `z`'s proprio channels and dropping it
+lowers the prediction loss at no cost. Neither SIGReg (Gaussianity) nor cosine
+curvature (straightness) constrains state information, so nothing forbids it.
+
+`objectives.py` forms `loss_visual + alpha * loss_proprio` with a per-dim mean on
+both sides, so the effective weight is `alpha * scale_proprio / scale_visual`.
+Measured: 0.001089 / 0.2598 → **alpha=1 behaves as alpha_eff = 0.0042**. The cost
+is 99.58% the channel that forgot the pusher and 0.42% the channel that kept it.
+In PushT the action *is* the pusher target, so the cost is nearly blind to what
+the actions control. With a frozen trunk this cannot happen: DINOv2's scales are
+fixed and its features retain the pusher. **alpha=1 was silently calibrated to a
+frozen encoder.**
+
+## Evidence
+
+| measurement | value | what it rules in/out |
+|---|---|---|
+| MPC success | 56.0 | NOT collapse — impossible with a dead latent |
+| `H_oracle` (GT actions, 0 GD steps) | **1.0** | harness sound; task is open-loop solvable |
+| `H_floor` (fixed actions) | **0.0** | 0.12 is above chance but barely |
+| rollout drift @ k=5 | 0.135 | NOT rollout drift; 1-step NMSE 1.1% |
+| `compound` @ k=5 / k=8 | 12.2 / 30.9 | error does amplify through feedback, from a small base |
+| `rho_local` (latent vs state dist) | 0.489 vs 0.517 pristine | geometry aligned and unchanged |
+| probe R² agent_x / agent_y | 0.943/0.947 → **−0.011/−0.618** | visual latent lost the pusher |
+| probe R² block_x / block_y | 0.945/0.942 → 0.979/0.989 | block retained |
+| probe R² agent, proprio channel | **0.997/0.998** | pusher IS in `z`, just not in the visual channel |
+| planning snr, visual / proprio | **2.91 / 33.68** | the clean channel is the ignored one |
+| proprio share of cost @ alpha=1 | **0.42%** | alpha_eff = 0.0042 |
+| `A_alpha0` vs `A_alpha1` | 0.12 vs 0.12 | proprio term is numerically inert |
+| `beat` @ k=5 | 0.065 | GT actions are not the cost's minimiser |
+| curvature cos, pristine → trained | −0.181 → **+0.706** | straightening WORKED |
+| pusher vs block state curvature | +0.599 vs +0.430 | pusher is *straighter*; curvature exonerated |
+| pusher-subspace ablation on DINOv2 | −0.0024 (control −0.0005, null −0.0000) | curvature indifferent to the pusher |
+
+## Hypotheses tested and refuted
+
+1. **Collapsed representation** — killed by MPC 56.
+2. **Autoregressive rollout drift** — killed by drift 0.135 at the protocol horizon.
+3. **Misaligned latent geometry** — killed by `rho_local` 0.489 ≈ pristine 0.517.
+4. **Curvature rewards forgetting the pusher** — killed twice: the pusher is
+   intrinsically *straighter* than the block (+0.599 vs +0.430), and ablating the
+   pusher subspace from pristine DINOv2 moves curvature by −0.0024 against a
+   control of −0.0005. The straightening term is innocent.
+5. **Broken eval harness** — killed by `H_oracle` = 1.0.
+
+## Fix shipped
+
+`planning/objectives.py`: `create_objective_fn(..., normalize=False)`. When True,
+each channel's term is divided by its own mean per-feature variance across the
+eval batch, making the objective scale-invariant so `alpha` is a true relative
+weight. Exposed as `objective.normalize` in the three plan configs, default
+`false`, so all five tracked Table-1 cells are byte-identical. Guarded by
+`tests/test_objective_normalize.py` (6 tests: default equivalence, that the
+unnormalized share collapses ~100x when proprio is scaled 0.01x, that the
+normalized share is invariant across 1e-2..1e2 rescaling of either channel, that
+alpha=1 becomes a near-even split, that all three modes honour the flag, and that
+a batch of 1 does not produce NaN).
+
+**Fairness requirement.** `normalize=true` must be applied to BOTH arms, or not at
+all. Tuning alpha for the method and not the baseline is not a comparison.
+
+## Open
+
+- Confirmation that the weighting is *causal*: `A_alpha240` / `A_alpha1400` and
+  `objective.normalize=true`. Prediction: substantial recovery over 13.33.
+- `O_descent` (GD started at the GT actions). Falls → cost minimum is not at the
+  correct actions; holds → zero-init basin.
+- Which term caused the redistribution: prediction-loss redundancy vs SIGReg.
+  Cheap test: ~10k-iteration runs with `proprio_encoder=dummy` (no offload target)
+  and with `SIGREG=0`, reading probe R² on state dims 0-1.
+- Frozen control on this pod, for its own alpha_eff and probe numbers.
+- MPC is n=1; generality beyond PushT untested.
