@@ -128,8 +128,12 @@ Started PID ${PID} (saved to .train_pid). Detached: survives disconnects.
   If val_probe_r2 heads to 0 the encoder has collapsed and the run is dead,
   no matter how nicely the training loss falls. Lower backbone_lr and retry.
 
-Run directory (note the _sig1e-1_e2e suffix keeps it apart from the baseline):
-  ${CKPT_BASE}/test/pusht_aggmlpcos1e-1_agg32_projchannel_dim8_hw14_sgFalse_lr1e-05_sig1e-1_e2e/
+Run directory: derived by hydra from the objective, so DO NOT assume it -- read it
+back from the log (a hardcoded path here was stale and misleading once already):
+  grep -m1 -oE "${CKPT_BASE}/test/[^ ]*" "${LOG}"
+  ls -d ${CKPT_BASE}/test/*/ -t | head -1
+The suffix encodes the variant: _sig1e-1_e2e for SIGReg end-to-end, plus _gp<coeff>
+when training.ground_proprio > 0, so each variant keeps its own checkpoint.
 
 Before burning ~12 h of GPU on this, confirm the objective on CPU in ~2 min:
   python -c "import experiments.verify_stop_grad as v; v.gates()"

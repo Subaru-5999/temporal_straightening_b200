@@ -85,6 +85,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ---------------------------------------------------------------- statistics
 
 
+def _require_ckpt(path):
+    """Fail with the real reason when the checkpoint is not there yet.
+
+    plan.py's load_model treats a missing file as 'no checkpoint supplied' and
+    then reports `Predictor not found in model checkpoint`, which sends you
+    looking at the model instead of at the clock: train.py only writes
+    model_latest.pth every training.save_every_x_iterations steps, so a freshly
+    launched run has no checkpoint for the first few minutes.
+    """
+    import glob
+    if path.exists():
+        return
+    have = sorted(os.path.basename(p) for p in glob.glob(os.path.join(
+        os.path.dirname(str(path)), "*.pth")))
+    raise SystemExit(
+        f"No checkpoint at {path}\n"
+        + (f"Available in that directory: {', '.join(have)}\n" if have else
+           "That directory has no .pth files at all.\n")
+        + "If the run just started, train.py writes model_latest.pth only every\n"
+          "training.save_every_x_iterations steps (default 1000). Check progress\n"
+          "with:  grep -o 'global_iter=[0-9]*' <train log> | tail -1"
+    )
+
+
 def _rank(x):
     """Average-tie-free rank transform (ordinal ranks are enough for Spearman)."""
     order = np.argsort(x, kind="stable")
@@ -302,8 +326,9 @@ def main():
     dset = traj["valid"]
 
     from pathlib import Path
-    model = load_model(Path(os.path.join(run, "checkpoints", f"model_{args.epoch}.pth")),
-                       cfg, cfg.num_action_repeat, device=device)
+    ckpt = Path(os.path.join(run, "checkpoints", f"model_{args.epoch}.pth"))
+    _require_ckpt(ckpt)
+    model = load_model(ckpt, cfg, cfg.num_action_repeat, device=device)
     model.eval()
     for p in model.parameters():
         p.requires_grad = False

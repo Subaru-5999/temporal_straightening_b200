@@ -314,9 +314,16 @@ def main():
                                    num_pred=cfg.num_pred, frameskip=frameskip)
         dset = traj["valid"]
 
-        ckpt = os.path.join(run, "checkpoints", f"model_{args.epoch}.pth")
         from pathlib import Path
-        model = load_model(Path(ckpt), cfg, cfg.num_action_repeat, device=device)
+        ckpt = Path(os.path.join(run, "checkpoints", f"model_{args.epoch}.pth"))
+        if not ckpt.exists():
+            raise SystemExit(
+                f"No checkpoint at {ckpt}. train.py writes model_latest.pth only "
+                "every training.save_every_x_iterations steps (default 1000), so a "
+                "freshly launched run has none yet. Check progress with:\n"
+                "  grep -o 'global_iter=[0-9]*' <train log> | tail -1"
+            )
+        model = load_model(ckpt, cfg, cfg.num_action_repeat, device=device)
         model.eval()
         for p in model.parameters():
             p.requires_grad = False
