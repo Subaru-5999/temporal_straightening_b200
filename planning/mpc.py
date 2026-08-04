@@ -71,7 +71,16 @@ class MPCPlanner(BasePlanner):
 
     def plan(self, obs_0, obs_g, actions=None):
         """
-        actions is NOT used
+        Args:
+            actions: optional warm start for the FIRST sub-planner call, i.e. the
+                initial guess handed to GD/CEM instead of the configured
+                sample_type init. This is what `debug_dset_init=true` supplies
+                (the ground-truth action sequence that generated the goal).
+                Previously it was dropped on the floor here, which silently made
+                `debug_dset_init` a no-op for every config whose top-level
+                planner is MPCPlanner -- including plan_gd.yaml (max_iter=1),
+                i.e. the open-loop arm of Table 1. Defaults to None, so the
+                behaviour of every tracked run is unchanged.
         Returns:
             actions: (B, T, action_dim) torch.Tensor
         """
@@ -81,7 +90,7 @@ class MPCPlanner(BasePlanner):
         init_obs_0, init_state_0 = self.evaluator.get_init_cond()
 
         cur_obs_0 = obs_0
-        memo_actions = None
+        memo_actions = actions
         while not np.all(self.is_success) and self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
             actions, _ = self.sub_planner.plan(
