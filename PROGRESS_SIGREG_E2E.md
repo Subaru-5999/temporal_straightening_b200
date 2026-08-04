@@ -338,3 +338,78 @@ all. Tuning alpha for the method and not the baseline is not a comparison.
   and with `SIGREG=0`, reading probe R² on state dims 0-1.
 - Frozen control on this pod, for its own alpha_eff and probe numbers.
 - MPC is n=1; generality beyond PushT untested.
+
+---
+
+# The fix works: proprio grounding (8k-step validation)
+
+`training.ground_proprio=1.0`, 8,000 steps (6.5% of the paper budget), everything
+else identical to the ungrounded run.
+
+## Representation
+
+| state dim | ungrounded @123,858 | pristine DINOv2 | **grounded @8,000** |
+|---|---|---|---|
+| agent_x | **−0.011** | +0.943 | **+0.991** |
+| agent_y | **−0.618** | +0.947 | **+0.993** |
+| block_x | +0.979 | +0.945 | +0.930 |
+| block_y | +0.989 | +0.942 | +0.899 |
+| block_angle | +0.622 | +0.732 | +0.514 |
+| vel_x / vel_y | −1.0 / −1.0 | −0.06 / +0.27 | +0.326 / −0.795 |
+| `rho_local` | 0.489 | 0.517 | **0.528** |
+| `nn_state_ratio` | 0.0227 | 0.0223 | **0.0187** |
+
+The agent ends up **above pristine DINOv2** (0.991 vs 0.943), which rules out
+"8k was too short to lose it": training moved agent decodability *up*, and
+nothing else in the objective rewards that. Cost: block precision slips
+(0.979 → 0.930) and the angle more so (0.622 → 0.514).
+
+## Planning (PushT open-loop GD, 50 samples, goal_H 25)
+
+| configuration | budget | success |
+|---|---|---|
+| ungrounded, α=1 | 100% | 13.33 ± 1.15 |
+| ungrounded, α=240 (its best) | 100% | 26.0 (1 seed) |
+| **grounded, α=1** | **6.5%** | **20.67 ± 1.15** (20/22/20) |
+| grounded, α=0 | 6.5% | 20.0 |
+| grounded, α=240 | 6.5% | 14.0 |
+| grounded, `normalize=true` | 6.5% | 18.0 |
+
++7.3 points over ungrounded at matched α, combined SE ~0.94, ~8σ. Statistically
+indistinguishable from the ungrounded model's BEST configuration while using
+6.5% of its training.
+
+## Grounding and alpha-reweighting are SUBSTITUTES, not complements
+
+α=240 helped the ungrounded model (0.12 → 0.26) and *hurts* the grounded one
+(0.20 → 0.14). One story covers both: without grounding the visual channel had
+lost the agent and proprio was its only source, so up-weighting proprio helped;
+with grounding the visual channel holds the agent at R² 0.991, so proprio is
+redundant and up-weighting it merely dilutes the block information. Same reason
+`normalize=true` (0.18) is slightly worse than α=1 (0.20). **Do not stack them.**
+It also explains why the α sweep saturated at 0.26 rather than recovering fully.
+
+Practical consequence: the best grounded configuration is the paper's own default
+α=1, so the comparison needs no protocol deviation.
+
+## Known issue with this configuration
+
+Grounding on all four proprio dims includes `vel_x, vel_y`, which are **not
+identifiable from a single frame**. Measured cost: `ground_proprio_loss`
+plateaus at 0.23 instead of approaching 0; straightness degrades to cos 0.327
+against 0.589 ungrounded; `z_loss` 0.0118 vs ~0.008 ungrounded at matched steps;
+visual velocity probes land at +0.326 / −0.795. At coefficient 1.0 grounding is
+**51% of the total objective** against prediction's 2.6%.
+`training.ground_proprio_dims=[0,1]` addresses all of it and is untested.
+
+## Engineering notes
+
+- `VWorldModel` is built after `accelerator.prepare()` and is never prepared, so
+  the grounding head needed explicit `.to(device)` AND explicit registration in
+  an optimizer. Without both the run dies two seconds into epoch 1 with a device
+  mismatch, and without the second the head stays at its random init and forces
+  the encoder to match a fixed random projection.
+- The head takes `action_encoder_lr` (5e-4), not `encoder_lr` (1e-5): a read-out
+  probe that trains slower than the representation it reads gives a stale gradient.
+- `ground_proprio` had to enter `run_naming.variant_tag()` or a grounded run
+  resolves to the ungrounded directory and auto-resumes it.
