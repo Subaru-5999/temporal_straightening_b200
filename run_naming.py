@@ -32,14 +32,21 @@ def fmt_coeff(value) -> str:
     return f"{mantissa}e{int(exp)}"
 
 
-def variant_tag(sigreg, sigreg_coeff, freeze_backbone, curv_on) -> str:
+def variant_tag(sigreg, sigreg_coeff, freeze_backbone, curv_on,
+                ground_proprio=0.0) -> str:
     """Suffix describing the objective/trainability variant.
 
+    `ground_proprio` MUST appear here. Without it a grounded run resolves to the
+    same directory as the ungrounded one, and train.py auto-resumes from
+    model_latest.pth -- so the fix would silently continue (and overwrite) the
+    completed run it is meant to be compared against.
+
     Examples:
-        (False, 0.0, True,  'features') -> ''                 (baseline, unchanged)
-        (True,  0.1, False, 'features') -> '_sig1e-1_e2e'
-        (True,  0.1, False, 'velocity') -> '_sig1e-1_e2e_curvvel'
-        (False, 0.0, False, 'features') -> '_e2e'             (negative control)
+        (False, 0.0, True,  'features')      -> ''            (baseline, unchanged)
+        (True,  0.1, False, 'features')      -> '_sig1e-1_e2e'
+        (True,  0.1, False, 'velocity')      -> '_sig1e-1_e2e_curvvel'
+        (False, 0.0, False, 'features')      -> '_e2e'        (negative control)
+        (True,  0.1, False, 'features', 1.0) -> '_sig1e-1_e2e_gp1e0'
     """
     parts = []
     if truthy(sigreg):
@@ -53,4 +60,10 @@ def variant_tag(sigreg, sigreg_coeff, freeze_backbone, curv_on) -> str:
         parts.append("e2e")
     if str(curv_on) == "velocity":
         parts.append("curvvel")
+    try:
+        gp = float(ground_proprio or 0)
+    except (TypeError, ValueError):
+        gp = 0.0
+    if gp > 0:
+        parts.append(f"gp{fmt_coeff(gp)}")
     return ("_" + "_".join(parts)) if parts else ""

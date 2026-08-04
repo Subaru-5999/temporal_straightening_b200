@@ -156,3 +156,42 @@ def test_proprio_in_dim_unwraps_a_ddp_style_wrapper():
     assert _proprio_in_dim(inner) == 7
     assert _proprio_in_dim(_Wrapped(inner)) == 7
     assert _proprio_in_dim(nn.Identity()) is None
+
+
+# --------------------------------------------------------------------------
+# Run naming. Without ground_proprio in the tag, a grounded run resolves to the
+# SAME directory as the ungrounded one and train.py auto-resumes from
+# model_latest.pth -- silently continuing and overwriting the very run the fix is
+# supposed to be compared against.
+# --------------------------------------------------------------------------
+
+from run_naming import variant_tag
+
+
+def test_defaults_still_produce_an_empty_tag():
+    assert variant_tag(False, 0.0, True, "features") == ""
+    assert variant_tag(False, 0.0, True, "features", 0.0) == ""
+
+
+def test_grounding_changes_the_run_directory():
+    ungrounded = variant_tag(True, 0.1, False, "features")
+    grounded = variant_tag(True, 0.1, False, "features", 1.0)
+    assert ungrounded == "_sig1e-1_e2e"
+    assert grounded == "_sig1e-1_e2e_gp1e0"
+    assert grounded != ungrounded, (
+        "a grounded run MUST get its own directory or it will resume the "
+        "ungrounded checkpoint"
+    )
+
+
+@pytest.mark.parametrize(
+    "coeff,expected",
+    [(1.0, "_gp1e0"), (0.1, "_gp1e-1"), (10.0, "_gp1e1"), (0.0, ""), (None, "")],
+)
+def test_grounding_coefficient_formatting(coeff, expected):
+    assert variant_tag(False, 0.0, True, "features", coeff) == expected
+
+
+def test_ground_proprio_is_optional_for_backwards_compatibility():
+    """Existing 4-argument callers must keep working."""
+    assert variant_tag(True, 0.1, False, "velocity") == "_sig1e-1_e2e_curvvel"
