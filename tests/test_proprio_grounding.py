@@ -195,3 +195,68 @@ def test_grounding_coefficient_formatting(coeff, expected):
 def test_ground_proprio_is_optional_for_backwards_compatibility():
     """Existing 4-argument callers must keep working."""
     assert variant_tag(True, 0.1, False, "velocity") == "_sig1e-1_e2e_curvvel"
+
+
+# --------------------------------------------------------------------------
+# Dimension selection. PushT proprio is [agent_x, agent_y, vel_x, vel_y] and
+# velocity is not identifiable from a single frame, so grounding on all four
+# spends half the gradient on an ill-posed target.
+# --------------------------------------------------------------------------
+
+
+def _model_dims(dims, ground_proprio=1.0, emb_dim=4, image_size=48):
+    num_patches = (image_size // 16) ** 2
+    return VWorldModel(
+        image_size=image_size, num_hist=2, num_pred=1,
+        encoder=_Enc(emb_dim=emb_dim, num_patches=num_patches),
+        proprio_encoder=_Prop(in_chans=4), action_encoder=_Act(in_chans=2, emb_dim=10),
+        decoder=None, predictor=None, proprio_dim=10, action_dim=10,
+        concat_dim=1, num_action_repeat=1, num_proprio_repeat=1,
+        ground_proprio=ground_proprio, ground_proprio_dims=dims,
+    )
+
+
+def test_all_dims_by_default():
+    m = _model_dims(None)
+    assert m.ground_head.out_features == 4
+    assert m.ground_dims.tolist() == [0, 1, 2, 3]
+
+
+def test_position_only_narrows_the_head():
+    m = _model_dims([0, 1])
+    assert m.ground_head.out_features == 2
+    assert m.ground_dims.tolist() == [0, 1]
+
+
+def test_loss_ignores_the_excluded_dimensions():
+    """Changing velocity must not change a position-only grounding loss."""
+    m = _model_dims([0, 1])
+    b, t, p, d = 8, 2, 9, 4
+    z = torch.cat([torch.randn(b, t, p, d), torch.zeros(b, t, p, 20)], dim=-1)
+    proprio = torch.randn(b, t, 4)
+    before = m.proprio_grounding_loss(z, proprio)
+    scrambled = proprio.clone()
+    scrambled[..., 2:] = torch.randn(b, t, 2) * 50      # wreck the velocities
+    torch.testing.assert_close(before, m.proprio_grounding_loss(z, scrambled))
+
+
+def test_loss_does_depend_on_the_included_dimensions():
+    m = _model_dims([0, 1])
+    b, t, p, d = 8, 2, 9, 4
+    z = torch.cat([torch.randn(b, t, p, d), torch.zeros(b, t, p, 20)], dim=-1)
+    proprio = torch.randn(b, t, 4)
+    before = m.proprio_grounding_loss(z, proprio)
+    moved = proprio.clone()
+    moved[..., :2] += 5.0
+    assert not torch.allclose(before, m.proprio_grounding_loss(z, moved))
+
+
+@pytest.mark.parametrize("dims", [[4], [-1], [0, 9], []])
+def test_out_of_range_dims_are_rejected(dims):
+    with pytest.raises(ValueError, match="ground_proprio_dims"):
+        _model_dims(dims)
+
+
+def test_dims_are_ignored_when_grounding_is_off():
+    m = _model_dims([0, 1], ground_proprio=0.0)
+    assert m.ground_head is None

@@ -49,6 +49,7 @@ class VWorldModel(nn.Module):
         sigreg_knots=17,
         sigreg_apply_to="agg",
         ground_proprio=0.0,
+        ground_proprio_dims=None,
         **kwargs,
     ):
         super().__init__()
@@ -219,17 +220,39 @@ class VWorldModel(nn.Module):
             # optimizers are constructed before any forward pass. Both sizes are
             # therefore read from the modules: the token count and channel width
             # from the encoder, the target width from the proprio encoder's input.
-            target_dim = _proprio_in_dim(self.proprio_encoder)
-            if not target_dim:
+            proprio_width = _proprio_in_dim(self.proprio_encoder)
+            if not proprio_width:
                 raise ValueError(
                     "ground_proprio > 0 needs the proprio encoder to expose its "
                     "input width (`in_chans`); use proprio_encoder=proprio."
                 )
+            # Which proprio dimensions to ground on. Grounding on ALL of them is
+            # wrong for PushT, whose proprio is [agent_x, agent_y, vel_x, vel_y]:
+            # velocity is not identifiable from a SINGLE frame, so half the target
+            # is ill-posed. Measured cost of including it (8k-step runs): the
+            # grounding loss plateaus near 0.23 instead of approaching 0, and
+            # straightness degrades to cos 0.327 against 0.589 ungrounded --
+            # forcing unpredictable high-frequency content into the latent is
+            # exactly what raises curvature. Ground on positions only.
+            if ground_proprio_dims is None:
+                dims = list(range(proprio_width))
+            else:
+                dims = [int(d) for d in ground_proprio_dims]
+                bad = [d for d in dims if not 0 <= d < proprio_width]
+                if bad or not dims:
+                    raise ValueError(
+                        f"ground_proprio_dims={ground_proprio_dims} is invalid for a "
+                        f"{proprio_width}-dim proprio observation."
+                    )
+            self.register_buffer(
+                "ground_dims", torch.as_tensor(dims, dtype=torch.long), persistent=False
+            )
             in_features = self._num_patches * self.encoder.emb_dim
-            self.ground_head = nn.Linear(in_features, target_dim)
+            self.ground_head = nn.Linear(in_features, len(dims))
             log.info(
-                "Proprio grounding enabled: coeff=%s, linear head %d -> %d",
-                self.ground_coeff, in_features, target_dim,
+                "Proprio grounding enabled: coeff=%s, linear head %d -> %d, "
+                "proprio dims %s of %d",
+                self.ground_coeff, in_features, len(dims), dims, proprio_width,
             )
         else:
             log.info("Proprio grounding disabled")
@@ -456,7 +479,9 @@ class VWorldModel(nn.Module):
                 "different token grid needs that made explicit."
             )
         pred = self.ground_head(flat)
-        return F.mse_loss(pred, proprio[:, : pred.shape[1]].to(pred.dtype))
+        target = proprio[:, : pred.shape[1]].to(pred.dtype)
+        target = target.index_select(-1, self.ground_dims.to(target.device))
+        return F.mse_loss(pred, target)
 
     def sigreg_loss(self, feats):
         """SIGReg on the visual latents.

@@ -88,6 +88,16 @@ training:
   # ground-truth actions score 1.0 -- the optimiser is fine, the cost's optimum is
   # in the wrong place. See PROGRESS_SIGREG_E2E.md.
   ground_proprio: 0.0
+
+  # Which proprio dimensions to ground on. null = all of them.
+  # For PushT proprio is [agent_x, agent_y, vel_x, vel_y] and VELOCITY IS NOT
+  # IDENTIFIABLE FROM A SINGLE FRAME, so grounding on all four spends half the
+  # gradient on an ill-posed target. Measured at 8k steps with all four dims:
+  # the grounding loss plateaus near 0.23 rather than approaching 0, and
+  # straightness falls to cos 0.327 against 0.589 for the ungrounded run --
+  # forcing unpredictable high-frequency content into the latent is exactly what
+  # raises curvature. Use [0, 1] for PushT.
+  ground_proprio_dims: null
   # Fine-tune the pretrained visual trunk (DINOv2). False = end-to-end JEPA.
   # True (default) reproduces the original behaviour, where the trunk was frozen
   # unconditionally regardless of model.train_encoder.
