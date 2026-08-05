@@ -583,3 +583,73 @@ determine planning performance in this setting.
 
 `training.ground_proprio=1.0`, all four proprio dims (the default `null`),
 `BACKBONE_LR=null`, α=1 per the comparability contract.
+
+---
+
+# Full grounded run, mid-flight readings
+
+`ground_proprio=1.0` (all four dims), `BACKBONE_LR=null`, 123,858 steps.
+Reproduces the 8k pilot to the 4th decimal over the first 600 steps, which also
+confirms empirically that `backbone_lr=null` and `1e-5` are equivalent here.
+
+| | 8k (pilot) | ~34k | ungrounded @matched step |
+|---|---|---|---|
+| `z_loss` | 0.0118 @4k | **0.0020** | 0.0019 @35.6k |
+| curvature (1−cos) | 0.6726 @4k | **0.3980** | 0.2684 @35.6k |
+| `ground_proprio_loss` | 0.2324 | **0.1394** | — |
+| grounding share of objective | 51% | **45%** | — |
+| `state[0]` / `state[1]` agent | 0.991 / 0.993 | **0.992 / 0.983** | −0.011 / −0.618 @full |
+| `state[2]` / `state[3]` block | 0.930 / 0.899 | **0.868 / 0.862** | 0.979 / 0.989 @full |
+| `state[4]` angle | 0.514 | **0.427** | 0.622 @full |
+| `state[5]` vel_x | +0.326 | **−0.085** | −1.0 @full |
+| visual `snr` | 3.21 | **3.21** | 2.91 @full |
+| `alpha_eff` | 0.0392 | **0.0040** | 0.0042 @full |
+
+## Confirmed
+
+- **The agent holds at 0.99** at 4x the pilot's budget. The original failure is
+  not recurring, and grounding costs nothing in prediction: `z_loss` tracks the
+  ungrounded run step for step (0.0020 vs 0.0019).
+- **Grounding does not run away.** Its loss keeps falling (0.605 -> 0.139) and its
+  share of the objective *drops* (54% -> 45%). The pilot's apparent plateau at
+  0.23 was the pilot ending early.
+- Curvature stays persistently worse than ungrounded (0.398 vs 0.268), a stable
+  gap. Grounding costs straightness. The pilots already showed planning does not
+  depend on it here (all-dims had worse curvature and better success).
+
+## Correction to an earlier claim
+
+The entry above stating "grounding repairs the scale imbalance by itself" is
+**false at longer budget**. Proprio spread rose 9x by 8k (alpha_eff 0.0042 ->
+0.0392) and then collapsed back to 0.00081 by 34k (alpha_eff 0.0040), matching the
+ungrounded run. Expected in hindsight: the grounding term constrains the VISUAL
+latent to predict the proprio observation and never constrains the proprio
+ENCODER, which is free to keep shrinking.
+
+This is now harmless, and the reason matters: `alpha_eff ~ 0.004` was fatal before
+because proprio was the ONLY carrier of agent position. With the visual channel
+holding it at 0.99, an inert proprio term costs nothing. Same number, opposite
+significance. Re-test alpha on the final checkpoint rather than assuming the 8k
+model's optimum carries over.
+
+## Hypothesis: an snr attractor near 3
+
+Between 8k and 34k `z_loss` fell 6x (0.0118 -> 0.0020) while visual `snr` did not
+move (3.21 -> 3.21). Since `snr = reach / rollout_error`, `reach` must have fallen
+by the same factor: **the encoder sheds action-relevant content and rollout error
+in lockstep.** That would also explain the ungrounded run sitting at 2.91 despite
+an excellent `z_loss`.
+
+If it holds, more budget does not raise `snr`, the final number lands near the
+pilot's 20.67, and beating the baseline requires something that moves `snr`
+structurally rather than more training. Two points only -- a third at ~15:00 tests
+it.
+
+## Erosion follows what is pinned
+
+The agent is grounded and holds; block, angle and velocity are unpinned and all
+decline. Same offloading mechanism as the original failure, now visible as a
+general principle: **the encoder sheds whatever the objective does not pin.**
+The design decision is therefore *what to pin*. Block position is not a model
+input, so pinning it would require ground-truth state as a training target -- a
+departure from the image+proprio+action setting that must be labelled as such.
