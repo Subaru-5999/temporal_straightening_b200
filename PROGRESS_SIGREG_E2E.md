@@ -540,3 +540,46 @@ is why α=240 helps the ungrounded model and hurts the grounded one, and why
 Full 123,858-step run uses **all four proprio dims at `ground_proprio=1.0`**,
 `BACKBONE_LR=null` to match the ungrounded config literally, α=1 per the
 comparability contract.
+
+---
+
+# Grounding-target ablation: both halves are needed
+
+Four models, 8,000 steps each, identical except for the grounding target.
+
+| target | visual snr | beat | rho_local | agent x/y | block x/y | angle | **success (3 seeds, α=1)** |
+|---|---|---|---|---|---|---|---|
+| none (ungrounded) | 2.91 | 0.065 | 0.489 | −0.011 / −0.618 | 0.979 / 0.989 | 0.622 | 13.33 ± 1.15 |
+| positions `[0,1]` | 1.09 | 0.140 | 0.511 | 0.997 / 0.994 | 0.974 / 0.905 | 0.756 | 7.33 ± 4.16 |
+| velocities `[2,3]` | 2.08 | 0.025 | 0.590 | 0.943 / 0.934 | 0.892 / 0.877 | 0.494 | 7.33 ± 3.06 |
+| **all four** | **3.21** | **0.019** | 0.528 | 0.991 / 0.993 | 0.930 / 0.899 | 0.514 | **20.67 ± 1.15** |
+
+**Ablating either half of the target breaks it.** Positions alone: 7.33.
+Velocities alone: 7.33. Both: 20.67. An interaction, not an additive effect.
+Position-only keeps the state but loses action sensitivity (snr 1.09 -- the
+action's effect on the terminal latent shrinks to the size of the rollout error).
+Velocity-only keeps moderate action sensitivity (snr 2.08) despite never learning
+velocity (probe 0.036/0.007, unlearnable from one frame) but degrades positional
+precision (block 0.892/0.877, angle 0.494). No single-mechanism account of why
+the combination is special; the prescription "ground on the full proprio
+observation" is what the data supports.
+
+## Correction to the earlier snr/beat claim
+
+On three models snr and beat both ranked success monotonically. The fourth model
+breaks `beat`: velocity-only has better beat than ungrounded (0.025 vs 0.065) and
+worse success (7.33 vs 13.33). `snr` has no inversions but is not injective
+(1.09 and 2.08 both give 7.33).
+
+Downgraded claim, which is what four points support: **low snr reliably predicts
+bad planning; high snr does not guarantee good planning.** Useful as a cheap
+negative filter before spending a full run, not as a success predictor.
+
+`rho_local` is dead as a predictor -- velocity-only has the best value of the four
+(0.590) and ties for worst success. Static geometry and state decodability do not
+determine planning performance in this setting.
+
+## Config chosen for the full run
+
+`training.ground_proprio=1.0`, all four proprio dims (the default `null`),
+`BACKBONE_LR=null`, α=1 per the comparability contract.
