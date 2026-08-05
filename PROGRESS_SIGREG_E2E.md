@@ -653,3 +653,72 @@ general principle: **the encoder sheds whatever the objective does not pin.**
 The design decision is therefore *what to pin*. Block position is not a model
 input, so pinning it would require ground-truth state as a training target -- a
 departure from the image+proprio+action setting that must be labelled as such.
+
+---
+
+# Full grounded run: FINAL (123,858 steps)
+
+`ground_proprio=1.0` (all four dims), `BACKBONE_LR=null`, paper-exact budget.
+
+## Training endpoint vs the ungrounded run
+
+| | grounded final | ungrounded |
+|---|---|---|
+| `z_loss` | **7.74e-04** | 0.0016 @47.4k |
+| curvature (1−cos) | 0.2873 | 0.2684 @35.6k |
+| `ground_proprio_loss` | 0.0921 (from 0.605) | — |
+| grounding share of objective | 38% (from 54%) | — |
+
+## Representation: matches pristine DINOv2, with a better predictor
+
+| probe | pristine DINOv2 | 8k | 34k | **final** |
+|---|---|---|---|---|
+| agent_x / agent_y | 0.943 / 0.947 | 0.991 / 0.993 | 0.992 / 0.983 | **0.993 / 0.991** |
+| block_x / block_y | 0.945 / 0.942 | 0.930 / 0.899 | 0.868 / 0.862 | **0.945 / 0.940** |
+| block_angle | 0.732 | 0.514 | 0.427 | **0.711** |
+| vel_x / vel_y | −0.06 / +0.27 | +0.33 / −0.80 | −0.09 / −0.58 | +0.003 / −0.258 |
+| `rho_local` | 0.517 | 0.528 | 0.506 | 0.475 |
+| `nn_state_ratio` | 0.0223 | 0.0187 | 0.0345 | 0.0202 |
+
+## Planning signal
+
+| k=5 | ungrounded | 8k | 34k | **final** |
+|---|---|---|---|---|
+| visual snr | 2.91 | 3.21 | 3.21 | **3.49** |
+| visual beat | 0.065 | 0.019 | 0.035 | **0.029** |
+| drift | 0.135 | — | — | **0.110** |
+| `alpha_eff` | 0.0042 | 0.0392 | 0.0040 | 0.0025 |
+
+Long-horizon profile of the final model: k=8 snr 2.50 (ungrounded 2.28), k=10 snr
+**2.14** beat 0.027 drift 0.308, k=12 snr 1.98 beat 0.035, k=15 snr **1.85** beat
+0.076 drift 0.533. `beat` stays 0.023–0.035 from k=6 to k=12, so the cost still
+identifies the correct actions well beyond the protocol horizon.
+
+## THREE EARLIER CONCLUSIONS CORRECTED
+
+**1. There is no snr attractor near 3.** Claimed after seeing snr 3.21 at both 8k
+and 34k while `z_loss` fell 6x. It reached 3.49 by 123,858. The effect is small but
+the hypothesis predicted exactly zero movement.
+
+**2. "The encoder sheds whatever the objective does not pin" was read off a
+mid-training dip.** block 0.930 → 0.868 and angle 0.514 → 0.427 at 34k both
+RECOVERED, to 0.945 and 0.711. The final visual latent matches pristine DINOv2 on
+the block and exceeds it on the agent.
+
+**3. "Long horizon is dead" was premature.** Called from the 34k checkpoint
+(k=10 snr 1.63, k=15 snr 1.06). The final model gives 2.14 and 1.85, with drift
+still well under 1 and `beat` low. The route is viable again.
+
+**Methodological lesson: mid-training representation metrics are non-monotone.**
+Use them to detect catastrophic failure (the agent going to zero), never to
+extrapolate a trend. Both wrong calls above came from treating a mid-run reading
+as a trajectory.
+
+## The measurement that is now most valuable
+
+The **frozen baseline's snr**. Our final representation matches pristine DINOv2 on
+every task-relevant dimension and has a strictly better predictor, so on the
+mechanistic account our snr should be at least the baseline's -- yet the baseline
+scores 77 and we expect ~20-27. Either the baseline's snr is far above 3.49, or snr
+saturates and a different quantity governs the remaining gap. Three GPU-minutes
+once a baseline checkpoint exists, and it decides whether the snr framing survives.

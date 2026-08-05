@@ -191,6 +191,26 @@ binomial standard error near p=0.2 is **5.7 points**, so single-seed gaps under
 
 ---
 
+## 7b. Mid-run readings are NOT a trajectory
+
+Representation metrics during training are non-monotone, and treating a mid-run
+reading as a trend produced two wrong calls on this project:
+
+| metric | 8k | 34k | final (123,858) |
+|---|---|---|---|
+| block_x probe | 0.930 | 0.868 | **0.945** |
+| block_angle probe | 0.514 | 0.427 | **0.711** |
+| visual snr @k=10 | — | 1.63 | **2.14** |
+| visual snr @k=15 | — | 1.06 | **1.85** |
+
+From the 34k column I concluded "the encoder sheds whatever the objective does not
+pin" and "long horizon is dead". Both dimensions recovered and both conclusions
+were wrong. The dip was real and transient.
+
+Use mid-run probes for exactly one thing: **detecting catastrophic failure** — the
+quantity you pinned collapsing toward zero. That is a step change, not a slope, and
+it justifies killing a run. Anything gentler is noise until the run finishes.
+
 ## 8. What a pilot cannot do
 
 - **Produce a reportable number.** Full budget only.
