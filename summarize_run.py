@@ -281,19 +281,13 @@ def discover_runs():
         if b.endswith(("_trainseed.json", ".timing.json")) or re.search(r"_seed\d+\.json$", b):
             continue
         base = b[:-len(".json")]
-        if base in names or base.startswith("table1_"):
-            continue
-        # results/ also holds diagnostic dumps (metric_alignment_*, rollout_drift_*,
-        # curvature_incentive) that are not runs. Only a file carrying a "run" key
-        # is a run record; otherwise --all prints a "no logs found" line per
-        # diagnostic and invites confusion about which names are real.
-        try:
-            rec = json.load(open(f))
-        except Exception:
-            continue
-        if isinstance(rec, dict) and "run" in rec:
+        if base not in names and not base.startswith("table1_"):
             names.append(base)
     return names
+    # NOTE: this is deliberately NAME-based, and only globs RESULTS_DIR/*.json (not
+    # subdirectories). Write diagnostic dumps to results/diagnostics/ so they are
+    # not mistaken for run records -- e.g.
+    #   python experiments/metric_alignment.py <run> --json results/diagnostics/x.json
 
 
 if __name__ == "__main__":

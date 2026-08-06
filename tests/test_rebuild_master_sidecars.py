@@ -102,12 +102,17 @@ def test_nested_run_names_do_not_pool_seeds(plan_outputs):
     assert len(short_vals) == 3, "the shorter name absorbed the longer run's logs"
 
 
-def test_discover_runs_ignores_diagnostic_dumps(results_dir):
+def test_diagnostics_in_a_subdirectory_are_not_discovered(results_dir):
+    """discover_runs is name-based and only globs results/*.json, not subdirs.
+
+    So diagnostic dumps belong in results/diagnostics/ -- putting them at the top
+    level makes --all emit a "no logs found" line per diagnostic.
+    """
     (results_dir / "myrun.json").write_text(json.dumps(_record("myrun")))
-    (results_dir / "metric_alignment_method.json").write_text(
-        json.dumps({"method.visual_patch": {"probe_r2": 0.5}})
-    )
-    (results_dir / "rollout_drift_method.json").write_text(json.dumps({"visual": {}}))
+    diag = results_dir / "diagnostics"
+    diag.mkdir()
+    (diag / "metric_alignment_method.json").write_text(json.dumps({"probe_r2": 0.5}))
+    (diag / "rollout_drift_method.json").write_text(json.dumps({"visual": {}}))
     names = summarize_run.discover_runs()
     assert "myrun" in names
     assert "metric_alignment_method" not in names
