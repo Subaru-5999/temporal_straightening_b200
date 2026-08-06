@@ -786,3 +786,44 @@ identifies the next grounding target: `state[4]` (angle, threshold pi/9) sits at
 `run` key -- crashing with `KeyError: 'run'` *after* a 50-minute evaluation had
 completed. Now skipped explicitly, plus a defensive filter for any record without
 a `run` key. Guarded by `tests/test_rebuild_master_sidecars.py`.
+
+---
+
+# FINAL TABLE (corrected — supersedes the numbers above)
+
+An earlier version of this record reported the ungrounded run's MPC as 56.0 (n=1)
+and the OL→MPC gap as +43. Both were wrong: `summarize_run.read_success_rates`
+globbed `f"{name}_*"`, and `..._e2e` is a strict prefix of `..._e2e_gp1e0`, so the
+shorter run absorbed the longer one's `logs.json`. It reported 6 pooled seeds
+(12/14/14 + 38/28/24) as one run. Fixed by anchoring the glob on the `_gH`
+boundary; guarded by `tests/test_rebuild_master_sidecars.py`.
+
+The bug never crashed. It silently averaged two different models into one row, and
+surfaced only because `n=6` tripped the seed-count warning. A run name being a
+strict prefix of another is exactly how a confidently wrong number reaches a paper.
+
+| PushT, α=1, 3 seeds (100/200/300), 50 samples | Open-loop | MPC | gap |
+|---|---|---|---|
+| e2e + SIGReg | 13.33 ± 1.15 (12/14/14) | 44.67 ± 10.26 (56/36/42) | **+31** |
+| **e2e + SIGReg + proprio grounding** | **30.00 ± 7.21** (38/28/24) | 40.00 ± 10.39 (34/34/52) | **+10** |
+| paper ✓ frozen baseline | 77.33 ± 6.18 | 85.33 ± 4.99 | +8 |
+
+Planning wall-clock, same checkpoint: GD 76.2 s, GD-MPC 1545.8 s, CEM ~660 s at
+equal success → **GD is 8.7x faster than CEM**.
+
+## Statistics
+
+- Open-loop **+16.7 points, 2.25x, ≈4σ** (SEMs 0.66 and 4.16).
+- MPC **−4.67 points, −0.55σ — statistically unchanged** (SEMs 5.92 and 6.00).
+
+The entire gain is in open-loop. That is exactly where a pusher-blind latent hurts
+and where MPC's per-step re-observation had been masking the defect, so the gap
+narrowing from +31 to +10 (baseline +8) is the structural signature of the repair.
+
+## Bottom line
+
+Proprio grounding recovers most of the damage that unfreezing a pretrained encoder
+causes, and does not produce a surplus. On PushT at H=5 a surplus was never
+available: pristine DINOv2 already probes ~0.94 on every dimension of the success
+criterion (`pos_diff` over agent_x/y + block_x/y, `angle_diff`), so frozen features
+are saturated and parity is the ceiling.
