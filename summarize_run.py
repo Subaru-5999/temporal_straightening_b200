@@ -51,7 +51,12 @@ BAND_TOL = 3.0
 def read_success_rates(root, name):
     """All final_eval/success_rate (%) values from THIS run's logs.json under `root`."""
     vals = []
-    pattern = os.path.join(root, f"{name}_*", "**", "logs.json")
+    # Anchor on the "_gH" boundary, NOT a bare "_*". plan.py names its output dir
+    # "<run>_gH<goal_H>_<goal_source>", and run names nest: "..._e2e" is a strict
+    # prefix of "..._e2e_gp1e0". With "{name}_*" the shorter run silently absorbed
+    # the longer one's logs.json, reporting 6 pooled seeds (12/14/14 + 38/28/24)
+    # as if they were one run's.
+    pattern = os.path.join(root, f"{name}_gH*", "**", "logs.json")
     for f in sorted(glob.glob(pattern, recursive=True)):
         for line in open(f):
             line = line.strip()
@@ -276,7 +281,17 @@ def discover_runs():
         if b.endswith(("_trainseed.json", ".timing.json")) or re.search(r"_seed\d+\.json$", b):
             continue
         base = b[:-len(".json")]
-        if base not in names and not base.startswith("table1_"):
+        if base in names or base.startswith("table1_"):
+            continue
+        # results/ also holds diagnostic dumps (metric_alignment_*, rollout_drift_*,
+        # curvature_incentive) that are not runs. Only a file carrying a "run" key
+        # is a run record; otherwise --all prints a "no logs found" line per
+        # diagnostic and invites confusion about which names are real.
+        try:
+            rec = json.load(open(f))
+        except Exception:
+            continue
+        if isinstance(rec, dict) and "run" in rec:
             names.append(base)
     return names
 

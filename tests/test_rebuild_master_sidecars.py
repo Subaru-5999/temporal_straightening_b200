@@ -62,3 +62,53 @@ def test_seed_variants_are_still_excluded(results_dir):
     assert "myrun" in text
     assert "myrun_seed7" not in text
     assert "myrun_ts" not in text
+
+
+# --------------------------------------------------------------------------
+# Run-name nesting. plan.py writes its logs to "<run>_gH<H>_<goal_source>/", and
+# run names nest: "..._e2e" is a strict prefix of "..._e2e_gp1e0". A "{name}_*"
+# glob made the shorter run absorb the longer one's logs.json and report 6 pooled
+# seeds as if they belonged to one run -- a wrong number that would have gone
+# straight into the paper.
+# --------------------------------------------------------------------------
+
+SHORT = "pusht_x_sgFalse_lr1e-05_sig1e-1_e2e"
+LONG = SHORT + "_gp1e0"
+
+
+def _write_logs(root, dirname, values, key="final_eval/success_rate"):
+    d = os.path.join(root, dirname, "sub")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "logs.json"), "w") as f:
+        for v in values:
+            f.write(json.dumps({key: v}) + "\n")
+
+
+@pytest.fixture
+def plan_outputs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_nested_run_names_do_not_pool_seeds(plan_outputs):
+    _write_logs("plan_outputs_gd", f"{SHORT}_gH25_dset", [0.12, 0.14, 0.14])
+    _write_logs("plan_outputs_gd", f"{LONG}_gH25_dset", [0.38, 0.28, 0.24])
+
+    short_vals = summarize_run.read_success_rates("plan_outputs_gd", SHORT)
+    long_vals = summarize_run.read_success_rates("plan_outputs_gd", LONG)
+
+    assert sorted(short_vals) == [12.0, 14.0, 14.0], short_vals
+    assert sorted(long_vals) == [24.0, 28.0, 38.0], long_vals
+    assert len(short_vals) == 3, "the shorter name absorbed the longer run's logs"
+
+
+def test_discover_runs_ignores_diagnostic_dumps(results_dir):
+    (results_dir / "myrun.json").write_text(json.dumps(_record("myrun")))
+    (results_dir / "metric_alignment_method.json").write_text(
+        json.dumps({"method.visual_patch": {"probe_r2": 0.5}})
+    )
+    (results_dir / "rollout_drift_method.json").write_text(json.dumps({"visual": {}}))
+    names = summarize_run.discover_runs()
+    assert "myrun" in names
+    assert "metric_alignment_method" not in names
+    assert "rollout_drift_method" not in names
