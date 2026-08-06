@@ -173,13 +173,20 @@ def rebuild_master():
         # (<cell>_seedN.json) and the training-seed aggregate (<cell>_trainseed.json)
         # are reported separately by aggregate_trainseeds.py.
         b = os.path.basename(f)
-        if b.endswith("_trainseed.json") or re.search(r"_seed\d+\.json$", b):
+        # `.timing.json` is a sidecar written by reproduce_table1.py holding
+        # per-arm wall-clock seconds, NOT a run record: it has no "run" key and
+        # loading it as one crashed rebuild_master with KeyError: 'run'.
+        if (b.endswith("_trainseed.json") or b.endswith(".timing.json")
+                or re.search(r"_seed\d+\.json$", b)):
             continue
         try:
             recs.append(json.load(open(f)))
         except Exception:
             pass
     order = {n: i for i, n in enumerate(PAPER)}
+    # Defensive: anything without a "run" key is not a run record. Drop it rather
+    # than crashing the whole master table over one stray file.
+    recs = [r for r in recs if isinstance(r, dict) and "run" in r]
     recs.sort(key=lambda r: order.get(r["run"], 999))
 
     # CEM / timing columns only appear once some run actually has them, so the

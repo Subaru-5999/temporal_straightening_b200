@@ -722,3 +722,67 @@ mechanistic account our snr should be at least the baseline's -- yet the baselin
 scores 77 and we expect ~20-27. Either the baseline's snr is far above 3.49, or snr
 saturates and a different quantity governs the remaining gap. Three GPU-minutes
 once a baseline checkpoint exists, and it decides whether the snr framing survives.
+
+---
+
+# HEADLINE RESULT: full grounded run, protocol evaluation
+
+PushT, 3 seeds (100/200/300), 50 samples, alpha=1, `goal_H=25`, GD planner.
+`reproduce_table1.py`, so both arms run the identical protocol.
+
+| | Open-loop | MPC | **OL→MPC gap** |
+|---|---|---|---|
+| e2e + SIGReg, ungrounded | 13.33 ± 1.15 | 56.0 (n=1) | **+43** |
+| **e2e + SIGReg + grounding** | **30.00 ± 7.21** (38/28/24) | **40.00 ± 10.39** (34/34/52) | **+10** |
+| paper ✓ frozen baseline | 77.33 ± 6.18 | 85.33 ± 4.99 | **+8** |
+
+Planning wall-clock on the same checkpoint: **GD 76.2 s, GD-MPC 1545.8 s, CEM ~660 s**
+(CEM measured earlier at equal success on the ungrounded model, i.e. GD is ~8.7x
+faster than CEM).
+
+## What the numbers say
+
+**Open-loop 13.33 → 30.00**, a 2.25x improvement at ~4σ (SEMs 0.66 and 4.16).
+Above the 20–27 predicted from the 8k pilot's snr.
+
+**The OL→MPC gap collapsed from +43 to +10, against the baseline's +8.** This is
+the strongest structural evidence that the representation defect is repaired, and
+it is independent of the absolute success rate. The +43 gap was the signature of a
+pusher-blind latent: MPC compensated by re-encoding a real observation every
+frameskip steps, so it never needed the agent to be *planned*. With the agent back
+in the visual latent (probe 0.993/0.991) open-loop no longer needs that crutch and
+the two settings become mutually consistent, exactly as they are for the baseline.
+
+**MPC 56.0 → 40.00 is −1.7σ** against a single-seed comparison with high variance
+(34/34/52). Not a regression, and expected: the crutch is no longer load-bearing.
+
+**Still far below the baseline's 77.33.** Grounding recovers most of the damage
+that unfreezing causes; it does not produce a surplus. On PushT at H=5 that was
+never available -- pristine DINOv2 already probes ~0.94 on every dimension of the
+success criterion.
+
+## Success criterion: correcting the record
+
+`env/pusht/pusht_wrapper.py:57`
+
+    pos_diff   = np.linalg.norm(goal_state[:4] - cur_state[:4])   # agent_x, agent_y, block_x, block_y
+    angle_diff = min(|d|, 2pi-|d|)
+    success    = pos_diff < 20 and angle_diff < pi/9
+
+`goal_state[:4]` includes the AGENT. Earlier notes stating "the block is what the
+task is scored on" are wrong: agent position is half of `pos_diff`, at equal
+weight, in a single 20-unit budget.
+
+This makes the whole diagnosis stronger. Deleting the agent from the visual latent
+(0.943 → −0.011) while the objective gave proprio 0.42% of the cost made the
+planner blind to **half the success metric**, not to a useful intermediate. And it
+identifies the next grounding target: `state[4]` (angle, threshold pi/9) sits at
+0.711 vs pristine 0.732 -- the weakest of the three scored quantities.
+
+## Bug fixed
+
+`summarize_run.rebuild_master()` globbed `results/*.json` and loaded
+`results/<run>.timing.json` -- a sidecar written by `reproduce_table1.py` with no
+`run` key -- crashing with `KeyError: 'run'` *after* a 50-minute evaluation had
+completed. Now skipped explicitly, plus a defensive filter for any record without
+a `run` key. Guarded by `tests/test_rebuild_master_sidecars.py`.
