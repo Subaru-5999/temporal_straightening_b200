@@ -524,6 +524,7 @@ class Trainer:
             cf_mode=self.cfg.training.get("cf_mode", "cos"),
             act_sens=self.cfg.training.get("act_sens", 0.0),
             act_sens_margin=self.cfg.training.get("act_sens_margin", 0.1),
+            cf_batch_frac=self.cfg.training.get("cf_batch_frac", 0.5),
         )
         self._log_trainable_params(self.model, "model")
 

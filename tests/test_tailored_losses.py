@@ -212,3 +212,23 @@ def test_cf_and_as_change_the_run_directory():
 ])
 def test_cf_as_coefficient_formatting(cf, ass, expected):
     assert variant_tag(False, 0.0, True, "features", 0.0, cf, ass) == expected
+
+
+# ------------------------------------------------- counterfactual batch fraction
+def test_cf_batch_frac_subsamples_the_arms():
+    """The arms may run on a subsample of the batch (memory knob); the terms
+    must still be produced and finite."""
+    torch.manual_seed(4)
+    m = _model(predictor=nn.Linear(24, 24, bias=False),
+               cf_curv=0.1, cf_H=3, act_sens=0.1, cf_batch_frac=0.5)
+    obs, act = _batch(b=6)
+    _, _, _, loss, comp = m.forward(obs, act)
+    assert torch.isfinite(loss)
+    assert "cf_curv_loss" in comp and "act_sens_loss" in comp
+
+
+def test_cf_batch_frac_is_validated():
+    with pytest.raises(ValueError):
+        _model(cf_curv=0.1, cf_batch_frac=0.0)
+    with pytest.raises(ValueError):
+        _model(cf_curv=0.1, cf_batch_frac=1.5)

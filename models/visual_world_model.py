@@ -56,6 +56,7 @@ class VWorldModel(nn.Module):
         cf_mode="cos",
         act_sens=0.0,
         act_sens_margin=0.1,
+        cf_batch_frac=0.5,
         **kwargs,
     ):
         super().__init__()
@@ -289,6 +290,14 @@ class VWorldModel(nn.Module):
         self.cf_mode = cf_mode
         self.act_sens_coeff = float(act_sens)
         self.act_sens_margin = float(act_sens_margin)
+        # Memory knob: counterfactual arms run extra encoder+predictor passes,
+        # so they may subsample the batch (stochastic regulariser; a half-batch
+        # estimate is fine). 1.0 = full batch.
+        self.cf_batch_frac = float(cf_batch_frac)
+        if self.cf_batch_frac <= 0 or self.cf_batch_frac > 1:
+            raise ValueError(
+                f"cf_batch_frac must be in (0, 1], got {self.cf_batch_frac}"
+            )
         if self.cf_curv_coeff > 0 or self.act_sens_coeff > 0:
             if self.cf_H < 2:
                 raise ValueError(
@@ -300,9 +309,9 @@ class VWorldModel(nn.Module):
                 )
             log.info(
                 "Counterfactual terms enabled: cf_curv=%s (H=%s, mode=%s), "
-                "act_sens=%s (margin=%s)",
+                "act_sens=%s (margin=%s), batch_frac=%s",
                 self.cf_curv_coeff, self.cf_H, self.cf_mode,
-                self.act_sens_coeff, self.act_sens_margin,
+                self.act_sens_coeff, self.act_sens_margin, self.cf_batch_frac,
             )
 
         self.decoder_criterion = nn.MSELoss()
@@ -549,19 +558,25 @@ class VWorldModel(nn.Module):
         """
         b, t_act = act.shape[:2]
         avail = t_act - self.num_hist              # future action frames in batch
-        obs0 = {k: v[:, : self.num_hist] for k, v in obs.items()}
-        arange_b = torch.arange(b, device=act.device)
+        # Subsample the batch for the arms: each arm runs an extra encoder +
+        # predictor pass, so half-batch arms halve that memory in both the
+        # forward and the (checkpointed) backward recompute.
+        m = b if self.cf_batch_frac >= 1.0 else max(3, int(b * self.cf_batch_frac))
+        sel = torch.randperm(b, device=act.device)[:m]
+        obs0 = {k: v[sel, : self.num_hist] for k, v in obs.items()}
+        act_s = act[sel]
+        arange_m = torch.arange(m, device=act.device)
         idx = torch.arange(self.cf_H, device=act.device) % avail
 
         perms, rolls = [], []
         while len(rolls) < 2:
-            p = torch.randperm(b, device=act.device)
-            if bool((p == arange_b).all()):
+            p = torch.randperm(m, device=act.device)
+            if bool((p == arange_m).all()):
                 continue
             if perms and bool((p == perms[0]).all()):
                 continue
-            fut = act[p][:, self.num_hist:]        # (b, avail, d), someone else's
-            a = torch.cat([act[:, : self.num_hist], fut[:, idx]], dim=1)
+            fut = act_s[p][:, self.num_hist:]      # (m, avail, d), someone else's
+            a = torch.cat([act_s[:, : self.num_hist], fut[:, idx]], dim=1)
             perms.append(p)
             # Activation-checkpoint the counterfactual rollout: these extra
             # predictor passes would otherwise double the retained ViT
@@ -571,15 +586,15 @@ class VWorldModel(nn.Module):
                     lambda o, aa: self.rollout(o, aa)[0]["visual"],
                     obs0, a, use_reentrant=False,
                 )
-            )   # (b, T, p, d)
+            )   # (m, T, p, d)
 
         out = {}
         if self.cf_curv_coeff > 0:
             out["cf_curv_loss"] = self.total_curvature(rolls[0], mode=self.cf_mode)
         if self.act_sens_coeff > 0:
             z1, z2 = rolls[0][:, -1], rolls[1][:, -1]
-            move = (z1 - z2).pow(2).flatten(1).mean(1)          # (b,) per sample
-            q = torch.randperm(b, device=act.device)
+            move = (z1 - z2).pow(2).flatten(1).mean(1)          # (m,) per sample
+            q = torch.randperm(m, device=act.device)
             spread = (z1[q] - z1).pow(2).flatten(1).mean(1)     # batch spread
             ratio = move.mean() / (spread.mean().detach() + 1e-8)
             out["act_sens_loss"] = F.relu(self.act_sens_margin - ratio)

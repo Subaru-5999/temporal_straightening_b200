@@ -111,6 +111,7 @@ training:
   cf_mode: cos            # cos = cost space (raw tokens) | aggcos = agg head
   act_sens: 0.0           # lambda_as: hinge on terminal-latent action response
   act_sens_margin: 0.1    # required motion, as a fraction of the batch spread
+  cf_batch_frac: 0.5      # fraction of the batch the cf arms use (memory knob)
 
   # Fine-tune the pretrained visual trunk (DINOv2). False = end-to-end JEPA.
   # True (default) reproduces the original behaviour, where the trunk was frozen
