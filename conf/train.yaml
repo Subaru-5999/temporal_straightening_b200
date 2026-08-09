@@ -18,9 +18,9 @@ hydra:
   # directory stays byte-identical; only the new opt-in variants get a suffix
   # (e.g. _sig1e-1_e2e).
   run:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on},${training.ground_proprio}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on},${training.ground_proprio},${training.cf_curv},${training.act_sens}}
   sweep:
-    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on},${training.ground_proprio}}
+    dir: ${ckpt_base_path}/test/${oc.select:env.save_name,${env.name}}_${replace_substring:${training.straighten},agg,agg${oc.select:encoder.agg_type,}}_agg32_proj${oc.select:encoder.projector,none}_dim${oc.select:encoder.projector_out_dim,384}_hw${oc.select:encoder.projector_target_hw,14}_sg${training.stop_grad}_lr${training.encoder_lr}${variant_tag:${training.sigreg},${training.sigreg_coeff},${training.freeze_backbone},${training.curv_on},${training.ground_proprio},${training.cf_curv},${training.act_sens}}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j
@@ -98,6 +98,20 @@ training:
   # forcing unpredictable high-frequency content into the latent is exactly what
   # raises curvature. Use [0, 1] for PushT.
   ground_proprio_dims: null
+
+  # ---- counterfactual geometry: the planner's degrees of freedom ------------
+  # The curvature term above only sees DATA trajectories. Planning optimises
+  # over counterfactual action sequences, and the Hessian of the planning cost
+  # splits into a first-order factor (dz_H/da)^T(dz_H/da) and a second-order
+  # term (z_H - z_g) . d^2z_H/da^2. Nothing else in the objective pins either
+  # for rollouts OFF the data distribution. These two terms do; 0.0 = off
+  # (default, every tracked run unchanged). See models/visual_world_model.py.
+  cf_curv: 0.0            # lambda_cf: straighten rollouts under WRONG actions
+  cf_H: 4                 # counterfactual rollout length in model steps (>= 2)
+  cf_mode: cos            # cos = cost space (raw tokens) | aggcos = agg head
+  act_sens: 0.0           # lambda_as: hinge on terminal-latent action response
+  act_sens_margin: 0.1    # required motion, as a fraction of the batch spread
+
   # Fine-tune the pretrained visual trunk (DINOv2). False = end-to-end JEPA.
   # True (default) reproduces the original behaviour, where the trunk was frozen
   # unconditionally regardless of model.train_encoder.

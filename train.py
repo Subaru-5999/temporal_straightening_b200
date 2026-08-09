@@ -519,6 +519,11 @@ class Trainer:
             sigreg_num_proj=self.cfg.training.get("sigreg_num_proj", 1024),
             sigreg_knots=self.cfg.training.get("sigreg_knots", 17),
             sigreg_apply_to=self.cfg.training.get("sigreg_apply_to", "agg"),
+            cf_curv=self.cfg.training.get("cf_curv", 0.0),
+            cf_H=self.cfg.training.get("cf_H", 4),
+            cf_mode=self.cfg.training.get("cf_mode", "cos"),
+            act_sens=self.cfg.training.get("act_sens", 0.0),
+            act_sens_margin=self.cfg.training.get("act_sens_margin", 0.1),
         )
         self._log_trainable_params(self.model, "model")
 

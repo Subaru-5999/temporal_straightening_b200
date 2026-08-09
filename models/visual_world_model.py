@@ -50,6 +50,11 @@ class VWorldModel(nn.Module):
         sigreg_apply_to="agg",
         ground_proprio=0.0,
         ground_proprio_dims=None,
+        cf_curv=0.0,
+        cf_H=4,
+        cf_mode="cos",
+        act_sens=0.0,
+        act_sens_margin=0.1,
         **kwargs,
     ):
         super().__init__()
@@ -256,6 +261,48 @@ class VWorldModel(nn.Module):
             )
         else:
             log.info("Proprio grounding disabled")
+
+        # ---- counterfactual geometry: what the planner actually needs --------
+        # The Hessian of the planning cost J(a) = || z_H(a) - z_g ||^2 splits as
+        #   d^2J/da^2 = 2 (dz_H/da)^T (dz_H/da)  +  2 (z_H - z_g) . d^2z_H/da^2 .
+        # SIGReg pins the latent distribution, the curvature term pins the
+        # DIRECTION of data velocities, grounding pins the content -- but the
+        # data-trajectory curvature term never sees rollouts OFF the data
+        # distribution, and nothing pins the first-order factor dz_H/da (how far
+        # the terminal latent moves when actions change). Both gaps were measured
+        # to bite (PROGRESS_SIGREG_E2E.md: snr ~3, representation matching
+        # pristine DINOv2 on probes yet 47 points short on planning). Two terms:
+        #   cf_curv   straightens predictor rollouts under WRONG action sequences
+        #             (another sample's actions held constant), measured in the
+        #             cost space. GD initialises actions at zero and refines, so
+        #             early planner iterates are near-constant action sequences --
+        #             exactly the regime this term covers.
+        #   act_sens  hinge requiring the terminal latent to MOVE when the action
+        #             sequence changes, normalised by the batch spread so it is
+        #             scale-invariant. Guards against an action-blind rollout map,
+        #             which no distributional or directional term can see.
+        self.cf_curv_coeff = float(cf_curv)
+        self.cf_H = int(cf_H)
+        if cf_mode not in ("cos", "aggcos"):
+            raise ValueError(f"cf_mode must be 'cos' or 'aggcos', got {cf_mode!r}")
+        self.cf_mode = cf_mode
+        self.act_sens_coeff = float(act_sens)
+        self.act_sens_margin = float(act_sens_margin)
+        if self.cf_curv_coeff > 0 or self.act_sens_coeff > 0:
+            if self.cf_H < 2:
+                raise ValueError(
+                    f"cf_H must be >= 2 (curvature needs 3 frames), got {self.cf_H}"
+                )
+            if self.act_sens_coeff > 0 and self.act_sens_margin <= 0:
+                raise ValueError(
+                    f"act_sens_margin must be > 0, got {self.act_sens_margin}"
+                )
+            log.info(
+                "Counterfactual terms enabled: cf_curv=%s (H=%s, mode=%s), "
+                "act_sens=%s (margin=%s)",
+                self.cf_curv_coeff, self.cf_H, self.cf_mode,
+                self.act_sens_coeff, self.act_sens_margin,
+            )
 
         self.decoder_criterion = nn.MSELoss()
         self.decoder_latent_loss_weight = 0.25
@@ -483,6 +530,52 @@ class VWorldModel(nn.Module):
         target = target.index_select(-1, self.ground_dims.to(target.device))
         return F.mse_loss(pred, target)
 
+    def _counterfactual_terms(self, obs, act):
+        """Curvature and action-sensitivity on rollouts under WRONG actions.
+
+        Training batches only hold num_hist + num_pred frames, so the future
+        action sequence for each arm is built by HOLDING another sample's
+        future actions for cf_H steps (wrapping when the batch window is
+        shorter). Each sample's own context actions are kept: they are part of
+        the initial encode, so every arm starts from the SAME initial latent
+        and the only difference between arms is the future action sequence --
+        the clean counterfactual, exactly as experiments/rollout_drift.py does
+        it offline.
+
+        Returns a dict with whichever of cf_curv_loss / act_sens_loss is
+        enabled. Fully differentiable: gradients reach the predictor, the
+        action encoder and the encoder of the initial window.
+        """
+        b, t_act = act.shape[:2]
+        avail = t_act - self.num_hist              # future action frames in batch
+        obs0 = {k: v[:, : self.num_hist] for k, v in obs.items()}
+        arange_b = torch.arange(b, device=act.device)
+        idx = torch.arange(self.cf_H, device=act.device) % avail
+
+        perms, rolls = [], []
+        while len(rolls) < 2:
+            p = torch.randperm(b, device=act.device)
+            if bool((p == arange_b).all()):
+                continue
+            if perms and bool((p == perms[0]).all()):
+                continue
+            fut = act[p][:, self.num_hist:]        # (b, avail, d), someone else's
+            a = torch.cat([act[:, : self.num_hist], fut[:, idx]], dim=1)
+            perms.append(p)
+            rolls.append(self.rollout(obs0, a)[0]["visual"])   # (b, T, p, d)
+
+        out = {}
+        if self.cf_curv_coeff > 0:
+            out["cf_curv_loss"] = self.total_curvature(rolls[0], mode=self.cf_mode)
+        if self.act_sens_coeff > 0:
+            z1, z2 = rolls[0][:, -1], rolls[1][:, -1]
+            move = (z1 - z2).pow(2).flatten(1).mean(1)          # (b,) per sample
+            q = torch.randperm(b, device=act.device)
+            spread = (z1[q] - z1).pow(2).flatten(1).mean(1)     # batch spread
+            ratio = move.mean() / (spread.mean().detach() + 1e-8)
+            out["act_sens_loss"] = F.relu(self.act_sens_margin - ratio)
+        return out
+
     def sigreg_loss(self, feats):
         """SIGReg on the visual latents.
 
@@ -593,6 +686,30 @@ class VWorldModel(nn.Module):
                 loss_components["ground_proprio_loss_scaled"] = (
                     ground_loss * self.ground_coeff
                 )
+
+            # Counterfactual geometry (see __init__): straightness and action
+            # sensitivity of predictor rollouts under WRONG action sequences --
+            # the regime the planner actually optimises in, which the
+            # data-trajectory curvature term never visits. Guards: the shuffle
+            # needs >= 3 batch elements, and at least one future action frame.
+            if (
+                (self.cf_curv_coeff > 0 or self.act_sens_coeff > 0)
+                and act.shape[0] >= 3
+                and act.shape[1] > self.num_hist
+            ):
+                cf = self._counterfactual_terms(obs, act)
+                if "cf_curv_loss" in cf:
+                    loss = loss + cf["cf_curv_loss"] * self.cf_curv_coeff
+                    loss_components["cf_curv_loss"] = cf["cf_curv_loss"]
+                    loss_components["cf_curv_loss_scaled"] = (
+                        cf["cf_curv_loss"] * self.cf_curv_coeff
+                    )
+                if "act_sens_loss" in cf:
+                    loss = loss + cf["act_sens_loss"] * self.act_sens_coeff
+                    loss_components["act_sens_loss"] = cf["act_sens_loss"]
+                    loss_components["act_sens_loss_scaled"] = (
+                        cf["act_sens_loss"] * self.act_sens_coeff
+                    )
         else:
             visual_pred = None
             z_pred = None
