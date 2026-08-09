@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from torchvision import transforms
 from einops import rearrange, repeat
 
@@ -562,7 +563,15 @@ class VWorldModel(nn.Module):
             fut = act[p][:, self.num_hist:]        # (b, avail, d), someone else's
             a = torch.cat([act[:, : self.num_hist], fut[:, idx]], dim=1)
             perms.append(p)
-            rolls.append(self.rollout(obs0, a)[0]["visual"])   # (b, T, p, d)
+            # Activation-checkpoint the counterfactual rollout: these extra
+            # predictor passes would otherwise double the retained ViT
+            # activations and OOM the slice; recompute them on backward.
+            rolls.append(
+                torch_checkpoint(
+                    lambda o, aa: self.rollout(o, aa)[0]["visual"],
+                    obs0, a, use_reentrant=False,
+                )
+            )   # (b, T, p, d)
 
         out = {}
         if self.cf_curv_coeff > 0:
