@@ -603,6 +603,38 @@ class VWorldModel(nn.Module):
             out["act_sens_loss"] = F.relu(self.act_sens_margin - ratio)
         return out
 
+    def counterfactual_loss(self, obs, act):
+        """Scaled counterfactual objective as a SEPARATE loss for train.py.
+
+        Returns (loss, components): `loss` is a scalar tensor (or None when
+        the terms are disabled or the batch is too small to shuffle), and
+        `components` carries the raw/scaled terms for telemetry. train.py
+        must backward this AFTER the main optimizer step, once the main graph
+        is freed, so the two backward peaks never stack on the GPU.
+
+        Gradients reach only the predictor and the action encoder (the
+        initial latent z0 is encoded detached), so stepping just those two
+        optimizers on this loss is exact.
+        """
+        if self.cf_curv_coeff <= 0 and self.act_sens_coeff <= 0:
+            return None, {}
+        if act.shape[0] < 3 or act.shape[1] <= self.num_hist:
+            return None, {}
+        cf = self._counterfactual_terms(obs, act)
+        loss = None
+        comp = {}
+        if "cf_curv_loss" in cf:
+            term = cf["cf_curv_loss"] * self.cf_curv_coeff
+            loss = term if loss is None else loss + term
+            comp["cf_curv_loss"] = cf["cf_curv_loss"]
+            comp["cf_curv_loss_scaled"] = term
+        if "act_sens_loss" in cf:
+            term = cf["act_sens_loss"] * self.act_sens_coeff
+            loss = term if loss is None else loss + term
+            comp["act_sens_loss"] = cf["act_sens_loss"]
+            comp["act_sens_loss_scaled"] = term
+        return loss, comp
+
     def sigreg_loss(self, feats):
         """SIGReg on the visual latents.
 
@@ -714,29 +746,11 @@ class VWorldModel(nn.Module):
                     ground_loss * self.ground_coeff
                 )
 
-            # Counterfactual geometry (see __init__): straightness and action
-            # sensitivity of predictor rollouts under WRONG action sequences --
-            # the regime the planner actually optimises in, which the
-            # data-trajectory curvature term never visits. Guards: the shuffle
-            # needs >= 3 batch elements, and at least one future action frame.
-            if (
-                (self.cf_curv_coeff > 0 or self.act_sens_coeff > 0)
-                and act.shape[0] >= 3
-                and act.shape[1] > self.num_hist
-            ):
-                cf = self._counterfactual_terms(obs, act)
-                if "cf_curv_loss" in cf:
-                    loss = loss + cf["cf_curv_loss"] * self.cf_curv_coeff
-                    loss_components["cf_curv_loss"] = cf["cf_curv_loss"]
-                    loss_components["cf_curv_loss_scaled"] = (
-                        cf["cf_curv_loss"] * self.cf_curv_coeff
-                    )
-                if "act_sens_loss" in cf:
-                    loss = loss + cf["act_sens_loss"] * self.act_sens_coeff
-                    loss_components["act_sens_loss"] = cf["act_sens_loss"]
-                    loss_components["act_sens_loss_scaled"] = (
-                        cf["act_sens_loss"] * self.act_sens_coeff
-                    )
+            # Counterfactual geometry (see __init__) lives in
+            # counterfactual_loss(), which train.py applies as a SEPARATE
+            # forward/backward AFTER the main optimizer step. Adding it to the
+            # main loss instead would stack the arms' backward recompute on top
+            # of the live main graph and overflow the GPU at e2e batch sizes.
         else:
             visual_pred = None
             z_pred = None

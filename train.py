@@ -999,6 +999,29 @@ class Trainer:
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
+            # Auxiliary counterfactual objective (cf_curv / act_sens), applied
+            # as its own forward/backward at the END of the iteration, after
+            # the main graph is explicitly freed below -- so the two backward
+            # peaks never stack on the GPU (the recurring OOM). Its gradients
+            # reach only the predictor + action encoder (the initial latent is
+            # encoded detached), so stepping just those two on it is exact.
+            del z_out, visual_out, visual_reconstructed
+            cf_comp = {}
+            if self.cfg.has_predictor:
+                cf_loss, cf_comp = self.model.counterfactual_loss(obs, act)
+                if cf_loss is not None:
+                    self.predictor_optimizer.zero_grad()
+                    self.action_encoder_optimizer.zero_grad()
+                    self.accelerator.backward(cf_loss)
+                    if self.model.train_predictor:
+                        self.predictor_optimizer.step()
+                        self.action_encoder_optimizer.step()
+                    self.telemetry.record(
+                        self.global_iter,
+                        **{f"loss/{k}": (v.item() if torch.is_tensor(v) else float(v))
+                           for k, v in cf_comp.items()},
+                    )
+
             if (
                 self.cfg.training.save_every_x_iterations > 0
                 and i % self.cfg.training.save_every_x_iterations == 0

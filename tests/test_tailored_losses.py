@@ -95,6 +95,8 @@ def test_off_by_default():
     assert "cf_curv_loss" not in comp
     assert "act_sens_loss" not in comp
     assert torch.isfinite(loss)
+    cf_loss, cf_comp = m.counterfactual_loss(obs, act)
+    assert cf_loss is None and cf_comp == {}
 
 
 def test_invalid_cf_mode_rejected():
@@ -119,8 +121,8 @@ def test_identity_predictor_gives_zero_cf_curvature():
     not NaN."""
     m = _model(cf_curv=0.1, cf_H=3)
     obs, act = _batch()
-    _, _, _, loss, comp = m.forward(obs, act)
-    assert "cf_curv_loss" in comp
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None and "cf_curv_loss" in comp
     assert comp["cf_curv_loss"].item() == 0.0
     assert torch.isfinite(comp["cf_curv_loss"])
 
@@ -132,7 +134,8 @@ def test_action_blind_rollout_pays_the_full_margin():
     margin = 0.25
     m = _model(act_sens=0.1, act_sens_margin=margin)
     obs, act = _batch()
-    _, _, _, _, comp = m.forward(obs, act)
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None
     assert comp["act_sens_loss"].item() == pytest.approx(margin, abs=1e-6)
 
 
@@ -143,24 +146,30 @@ def test_action_responsive_predictor_reduces_the_hinge():
     m = _model(predictor=nn.Linear(24, 24, bias=False),
                act_sens=0.1, act_sens_margin=0.1)
     obs, act = _batch()
-    _, _, _, _, comp = m.forward(obs, act)
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None
     assert torch.isfinite(comp["act_sens_loss"])
     assert comp["act_sens_loss"].item() < 0.1
 
 
-def test_terms_are_differentiable_and_reach_predictor_and_encoder():
+def test_terms_are_differentiable_and_reach_predictor_and_action_encoder():
     torch.manual_seed(2)
     pred = nn.Linear(24, 24, bias=False)
     m = _model(predictor=pred, cf_curv=0.1, cf_H=3, act_sens=0.1)
     obs, act = _batch()
-    _, _, _, loss, comp = m.forward(obs, act)
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None
     assert "cf_curv_loss_scaled" in comp and "act_sens_loss_scaled" in comp
     loss.backward()
     assert pred.weight.grad is not None and pred.weight.grad.abs().sum() > 0, (
         "the counterfactual terms must push gradient into the predictor, or "
         "they cannot straighten the rollout map"
     )
-    assert m.encoder.lin.weight.grad is not None
+    assert m.action_encoder.lin.weight.grad is not None
+    # The initial latent is encoded DETACHED by design: the arms train the
+    # rollout map (predictor + action encoder), never the encoder -- that is
+    # exactly what keeps their memory peak standalone on the GPU.
+    assert m.encoder.lin.weight.grad is None
 
 
 def test_small_batch_skips_terms_instead_of_crashing():
@@ -169,9 +178,11 @@ def test_small_batch_skips_terms_instead_of_crashing():
     philosophy: degenerate inputs contribute exactly nothing)."""
     m = _model(cf_curv=0.1, act_sens=0.1)
     obs, act = _batch(b=2)
-    _, _, _, loss, comp = m.forward(obs, act)
-    assert torch.isfinite(loss)
-    assert "cf_curv_loss" not in comp
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is None and comp == {}
+    _, _, _, main_loss, main_comp = m.forward(obs, act)
+    assert torch.isfinite(main_loss)
+    assert "cf_curv_loss" not in main_comp
 
 
 def test_scaled_components_match_coefficients():
@@ -179,7 +190,8 @@ def test_scaled_components_match_coefficients():
     m = _model(predictor=nn.Linear(24, 24, bias=False),
                cf_curv=0.3, cf_H=3, act_sens=0.7)
     obs, act = _batch()
-    _, _, _, _, comp = m.forward(obs, act)
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None
     torch.testing.assert_close(comp["cf_curv_loss_scaled"],
                                comp["cf_curv_loss"] * 0.3)
     torch.testing.assert_close(comp["act_sens_loss_scaled"],
@@ -222,7 +234,8 @@ def test_cf_batch_frac_subsamples_the_arms():
     m = _model(predictor=nn.Linear(24, 24, bias=False),
                cf_curv=0.1, cf_H=3, act_sens=0.1, cf_batch_frac=0.5)
     obs, act = _batch(b=6)
-    _, _, _, loss, comp = m.forward(obs, act)
+    loss, comp = m.counterfactual_loss(obs, act)
+    assert loss is not None
     assert torch.isfinite(loss)
     assert "cf_curv_loss" in comp and "act_sens_loss" in comp
 
