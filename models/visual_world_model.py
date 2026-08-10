@@ -553,20 +553,27 @@ class VWorldModel(nn.Module):
         it offline.
 
         Returns a dict with whichever of cf_curv_loss / act_sens_loss is
-        enabled. Fully differentiable: gradients reach the predictor, the
-        action encoder and the encoder of the initial window.
+        enabled. The initial latent is encoded ONCE under no_grad and held
+        fixed -- the counterfactual varies only the actions -- so gradients
+        reach the predictor and the action encoder (the rollout map), i.e.
+        exactly the first-order Hessian factor the planner needs.
         """
         b, t_act = act.shape[:2]
         avail = t_act - self.num_hist              # future action frames in batch
-        # Subsample the batch for the arms: each arm runs an extra encoder +
-        # predictor pass, so half-batch arms halve that memory in both the
-        # forward and the (checkpointed) backward recompute.
+        # Subsample the batch for the arms (memory knob; the terms are
+        # stochastic regularisers, a partial-batch estimate is fine).
         m = b if self.cf_batch_frac >= 1.0 else max(3, int(b * self.cf_batch_frac))
         sel = torch.randperm(b, device=act.device)[:m]
         obs0 = {k: v[sel, : self.num_hist] for k, v in obs.items()}
         act_s = act[sel]
         arange_m = torch.arange(m, device=act.device)
         idx = torch.arange(self.cf_H, device=act.device) % avail
+
+        # Fixed initial latent: encode once, detached. The arms then run
+        # predictor-only rollouts (_rollout_from_z) -- no encoder memory at
+        # all in the arms, which is what keeps the slice inside its budget.
+        with torch.no_grad():
+            z0 = self.encode(obs0, act_s[:, : self.num_hist])
 
         perms, rolls = [], []
         while len(rolls) < 2:
@@ -576,15 +583,11 @@ class VWorldModel(nn.Module):
             if perms and bool((p == perms[0]).all()):
                 continue
             fut = act_s[p][:, self.num_hist:]      # (m, avail, d), someone else's
-            a = torch.cat([act_s[:, : self.num_hist], fut[:, idx]], dim=1)
             perms.append(p)
-            # Activation-checkpoint the counterfactual rollout: these extra
-            # predictor passes would otherwise double the retained ViT
-            # activations and OOM the slice; recompute them on backward.
+            # Activation-checkpoint the predictor loop; recompute on backward.
             rolls.append(
                 torch_checkpoint(
-                    lambda o, aa: self.rollout(o, aa)[0]["visual"],
-                    obs0, a, use_reentrant=False,
+                    self._rollout_from_z, z0, fut[:, idx], use_reentrant=False,
                 )
             )   # (m, T, p, d)
 
@@ -799,3 +802,31 @@ class VWorldModel(nn.Module):
         z = torch.cat([z, z_new], dim=1)
         z_obses, z_acts = self.separate_emb(z)
         return z_obses, z
+
+    def _rollout_from_z(self, z0, action):
+        """Predictor-only rollout from a FIXED initial latent (no encoder).
+
+        Mirrors rollout()'s predict loop minus encode(): z0 already carries
+        the context frames and their action tokens; `action` supplies only
+        the future action frames. Used by the counterfactual terms, which
+        hold the initial latent constant and vary only the actions -- so the
+        encoder never runs (or backprops) for the arms.
+
+        input:  z0: (b, n, num_patches, emb_dim) initial latent (detached)
+                action: (b, t, action_dim) future actions
+        output: visual latents (b, t+n+1, num_patches, emb_dim)
+        """
+        z = z0
+        t = 0
+        inc = 1
+        while t < action.shape[1]:
+            z_pred = self.predict(z[:, -self.num_hist :])
+            z_new = z_pred[:, -inc:, ...]
+            z_new = self.replace_actions_from_z(z_new, action[:, t : t + inc, :])
+            z = torch.cat([z, z_new], dim=1)
+            t += inc
+
+        z_pred = self.predict(z[:, -self.num_hist :])
+        z = torch.cat([z, z_pred[:, -1:, ...]], dim=1)
+        z_obses, _ = self.separate_emb(z)
+        return z_obses["visual"]
