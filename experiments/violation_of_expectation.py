@@ -99,8 +99,10 @@ def main():
         hist_obs = {k: v[:, :num_hist] for k, v in obs.items()}
         with torch.no_grad():
             # The model's own expectation: rollout future under true actions.
-            z_pred_obs, _ = model.rollout(hist_obs, act)
-            z_pred = future_visual(model, z_pred_obs, num_hist, K)
+            # rollout() returns (separated obs dict, concatenated z tensor);
+            # visual_only() needs the concatenated tensor.
+            _, z_pred = model.rollout(hist_obs, act)
+            z_pred = future_visual(model, z_pred, num_hist, K)
 
             # Encoded continuations sharing the same history.
             z_true = future_visual(model, model.encode(obs, act), num_hist, K)
