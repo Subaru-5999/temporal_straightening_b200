@@ -5,9 +5,11 @@ defaults:
 
 hydra:
   run:
-    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    # CEM sub_planner has no lr/action_noise/sample_type (those are GD-only);
+    # interpolate only the keys that exist, else Hydra errors at job start.
+    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_cem_ns${planner.sub_planner.num_samples}_topk${planner.sub_planner.topk}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}
   sweep:
-    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_gd_lr${planner.sub_planner.lr}_an${planner.sub_planner.action_noise}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}_init${planner.sub_planner.sample_type}
+    dir: plan_outputs_cem/${replace_slash:${model_name}}_gH${goal_H}_${goal_source}/${ckpt_base_path}_cem_ns${planner.sub_planner.num_samples}_topk${planner.sub_planner.topk}_opt${planner.sub_planner.opt_steps}_obj${objective.mode}
     subdir: ${hydra.job.num}
   launcher:
     submitit_folder: ${hydra.sweep.dir}/.submitit/%j

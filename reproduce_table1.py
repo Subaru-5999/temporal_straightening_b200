@@ -212,7 +212,18 @@ def run_eval(name, base, arms=("gd", "gd_mpc")):
 
     if timings:
         os.makedirs("results", exist_ok=True)
-        with open(os.path.join("results", f"{name}.timing.json"), "w") as f:
+        tpath = os.path.join("results", f"{name}.timing.json")
+        # Merge, don't clobber: a later `--planners cem` re-run must keep the
+        # gd/gd_mpc timings recorded by the earlier full pass.
+        if os.path.isfile(tpath):
+            try:
+                with open(tpath) as f:
+                    prev = json.load(f)
+            except Exception:
+                prev = {}
+            prev.update(timings)
+            timings = prev
+        with open(tpath, "w") as f:
             json.dump(timings, f, indent=2)
 
     # Immediate, run-scoped summary + results/<name>.json
